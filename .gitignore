@@ -1,0 +1,34 @@
+# Environments
+.venv/
+venv/
+env/
+
+# Secrets
+.env
+
+# Build / packaging
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Pipeline data (never commit source documents or generated artifacts)
+data/inbox/*
+data/work/*
+data/exports/*
+!data/inbox/.gitkeep
+!data/work/.gitkeep
+!data/exports/.gitkeep
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
