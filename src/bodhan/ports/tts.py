@@ -16,11 +16,6 @@ class TTSPort(ABC):
         """File extension (with dot) produced by this implementation."""
         return ".mp3"
 
-    @property
-    def fallback_count(self) -> int:
-        """Segments served by a fallback engine (0 for single-engine TTS)."""
-        return 0
-
     @abstractmethod
     async def synthesize(
         self,

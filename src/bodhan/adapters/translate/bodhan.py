@@ -34,7 +34,9 @@ Rules honoured here:
 - no source-language field exists (the API infers it) - none is sent;
 - exactly one user turn (two are rejected with 400 by the gateway);
 - truncated/incomplete output raises, never passes downstream;
-- 401/400/413/422 are terminal (no retry); 408/425/429/5xx retry with backoff;
+- 401/400/413/422 are terminal (no retry); 408/425/429/5xx retry with backoff,
+  and a ``429`` waits out the documented ``retry-after`` header (the published
+  requests-per-minute allowance is 8 for ``indic-translate``);
 - published rate limits are read from response headers, never hardcoded.
 """
 
@@ -51,6 +53,7 @@ from tenacity import (
 )
 
 from bodhan.adapters.rate_limit import RateLimitInfo, read_rate_limit
+from bodhan.adapters.retry import RetryAfterWait, read_retry_after
 from bodhan.adapters.translate.errors import (
     TranslationProviderError,
     TranslationResponseError,
@@ -124,7 +127,7 @@ class BodhanTranslateAdapter(TranslatePort):
         try:
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(self._max_retries),
-                wait=wait_exponential(multiplier=1.0, max=30.0),
+                wait=RetryAfterWait(wait_exponential(multiplier=1.0, max=30.0)),
                 retry=retry_if_exception(_is_retryable),
                 reraise=True,
             ):
@@ -183,6 +186,7 @@ class BodhanTranslateAdapter(TranslatePort):
             f"translate HTTP {response.status_code}: {message}",
             status_code=response.status_code,
             code=code,
+            retry_after=read_retry_after(response),
         )
 
     @staticmethod

@@ -13,6 +13,7 @@ from bodhan.domain.models import AudioSegment, Chapter, OCRBlock, OCRResult, Pag
 from bodhan.pipeline.prompts import parse_json_response
 from bodhan.pipeline.stages.base import StageContext
 from bodhan.ports.llm import LLMMessage, LLMResponse
+from bodhan.ports.transcribe import TranscribePort, TranscriptionResult
 from bodhan.ports.translate import TranslatePort, TranslationResult
 from bodhan.ports.tts import TTSPort
 from bodhan.services.artifact_store import FileArtifactStore
@@ -105,21 +106,31 @@ class FakeLLM:
             self.calls.append("translate")
             items = [{"id": b["id"], "text": b["text"]} for b in payload["blocks"]]
             text = json.dumps({"items": items}, ensure_ascii=False)
-        elif "teacher authoring" in system:
+        elif "pedagogical lesson planner" in system:
+            # English-only lesson plan: compose translates every unit itself.
             self.calls.append("compose")
+            block_ids = [b["id"] for b in payload["content"]]
             text = json.dumps(
                 {
-                    "title": payload["chapter_title"],
-                    "markdown": (
-                        "# पाठ\n"
-                        "## अध्याय के उद्देश्य\n- उद्देश्य एक\n- उद्देश्य दो\n"
-                        "## पाठ\n"
-                        "यह मुख्य विषय है।\n"
-                        "- पहला बिंदु\n- दूसरा बिंदु\n"
-                        "## सारांश\nसंक्षेप में यह पाठ।\n"
-                        "## मुख्य शब्दावली\n- शब्द: अर्थ\n"
-                        "## अभ्यास प्रश्न\n- प्रश्न? उत्तर।\n"
-                    ),
+                    "title_en": payload["chapter_title"],
+                    "sections": [{"heading_en": "Main ideas", "block_ids": block_ids}],
+                    "objectives_en": ["Objective one", "Objective two"],
+                    "summary_en": "A short summary of the chapter.",
+                    "glossary_en": [
+                        {
+                            "term_en": "Key term",
+                            "description_en": "What the term means.",
+                            "block_id": block_ids[0],
+                        }
+                    ],
+                    "exercises_en": [
+                        {
+                            "question_en": "What is covered here?",
+                            "answer_en": "The main idea.",
+                            "block_ids": block_ids,
+                        }
+                    ],
+                    "narration_en": ["Speak slowly when introducing the key term."],
                 },
                 ensure_ascii=False,
             )
@@ -180,7 +191,44 @@ class FakeTranslate(TranslatePort):
         return None
 
 
-def make_context(tmp_path: Path, *, pages: int = 2, chapter_id: str = "chapter-01") -> StageContext:
+class FakeTranscribe(TranscribePort):
+    """Deterministic transcribe: marks text with the language, records calls.
+
+    The returned text is deliberately unrelated to the narration script so
+    tests can prove the stage stores provider output verbatim instead of
+    reusing or rewriting the script.
+    """
+
+    provider = "fake-transcribe"
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.languages: list[str | None] = []
+
+    async def transcribe(
+        self, audio_path: Path, *, language: str | None = None
+    ) -> TranscriptionResult:
+        self.calls.append(str(audio_path))
+        self.languages.append(language)
+        text = f"[{language}] {audio_path.stem} का पाठ"
+        return TranscriptionResult(
+            text=text,
+            model="indic-transcribe",
+            language=language,
+            provider=self.provider,
+            latency_ms=7,
+            request_id=f"req-{audio_path.stem}",
+            usage={"audio_seconds": 0.5},
+            raw=[{"text": text}],
+        )
+
+    async def aclose(self) -> None:
+        return None
+
+
+def make_context(
+    tmp_path: Path, *, pages: int = 2, chapter_id: str = "chapter-01", target: str = "hi"
+) -> StageContext:
     settings = Settings(project_root=tmp_path, data_dir="data")
     store = FileArtifactStore(settings.work_dir / chapter_id)
     chapter = Chapter(
@@ -188,7 +236,7 @@ def make_context(tmp_path: Path, *, pages: int = 2, chapter_id: str = "chapter-0
         title="Chapter 1",
         source_path=str(tmp_path / f"{chapter_id}.pdf"),
         language_code="en",
-        target_language_code="hi",
+        target_language_code=target,
     )
     return StageContext(
         settings=settings,
@@ -198,6 +246,7 @@ def make_context(tmp_path: Path, *, pages: int = 2, chapter_id: str = "chapter-0
         llm=FakeLLM(),  # type: ignore[arg-type]
         translate=FakeTranslate(),  # type: ignore[arg-type]
         tts=FakeTTS(),  # type: ignore[arg-type]
+        transcribe=FakeTranscribe(),  # type: ignore[arg-type]
         logger=logging.getLogger("test"),
     )
 

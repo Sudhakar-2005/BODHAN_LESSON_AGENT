@@ -1,8 +1,10 @@
 """Shared prompt/response helpers for the LLM-backed stages.
 
-The LLM is only ever asked to *annotate* OCR output (structure, quality,
-translation, composition) -- never to produce source text that OCR did not
-return.
+The LLM is only ever asked to *annotate* OCR output (structure, quality)
+and to plan lesson scaffolding in English (composition) - never to extract
+text, never to translate, and never to write Hindi, Tamil, Bengali or any
+other Indian-language content: every target-language string comes from
+Bodhan Indic-Translate.
 """
 
 from __future__ import annotations

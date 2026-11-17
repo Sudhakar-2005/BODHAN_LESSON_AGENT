@@ -8,7 +8,9 @@ Request (application/json, documented fields only)::
      "instructions": "{\\"lang\\": \\"hi\\"[, \\"style\\": \\"…\\"]}"}
 
 Response: raw ``audio/wav`` (PCM16, 24 kHz, mono). Errors: ``422`` when
-input/voice/lang/style are invalid, ``401`` for auth, ``429`` for quota.
+input/voice/lang/style are invalid, ``401`` for auth, ``429`` when out of
+credit (terminal) or when the per-key rate allowance is exceeded (the
+documented ``429`` + ``retry-after`` case, retried until the window frees).
 
 Documented operating limits honoured here:
 - "keep each request to a sentence or two, about 30 seconds of speech;
@@ -38,6 +40,7 @@ from tenacity import (
 )
 
 from bodhan.adapters.rate_limit import RateLimitInfo, read_rate_limit
+from bodhan.adapters.retry import RetryAfterWait, read_retry_after
 from bodhan.adapters.tts.errors import TTSProviderError, TTSResponseError
 from bodhan.domain.models import AudioSegment
 from bodhan.ports.tts import TTSPort
@@ -49,7 +52,14 @@ _SENTENCE_BOUNDARY = re.compile(r"(?<=[।.!?])\s+")
 def _is_retryable(exc: BaseException) -> bool:
     if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
         return True
-    return isinstance(exc, TTSProviderError) and exc.status_code in _RETRYABLE_STATUS
+    if not isinstance(exc, TTSProviderError):
+        return False
+    if exc.status_code == 429:
+        # Documented: the rate-limit 429 carries `retry-after` (4 RPM
+        # sliding window); an out-of-credit 429 does not - that one is
+        # terminal and must not be retried.
+        return exc.retry_after is not None
+    return exc.status_code in _RETRYABLE_STATUS
 
 
 def split_for_speech(text: str, max_chars: int) -> list[str]:
@@ -235,7 +245,7 @@ class BodhanSpeakAdapter(TTSPort):
         try:
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(self._max_retries),
-                wait=wait_exponential(multiplier=1.0, max=30.0),
+                wait=RetryAfterWait(wait_exponential(multiplier=1.0, max=30.0)),
                 retry=retry_if_exception(_is_retryable),
                 reraise=True,
             ):
@@ -281,4 +291,5 @@ class BodhanSpeakAdapter(TTSPort):
             f"speech HTTP {response.status_code}: {message}",
             status_code=response.status_code,
             code=code,
+            retry_after=read_retry_after(response),
         )

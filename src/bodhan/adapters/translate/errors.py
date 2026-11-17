@@ -12,10 +12,14 @@ class TranslationProviderError(Exception):
         *,
         status_code: int | None = None,
         code: str | None = None,
+        retry_after: float | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
+        #: Seconds the provider asked us to wait (documented ``retry-after``
+        #: header on ``429``); ``None`` when absent or unparseable.
+        self.retry_after = retry_after
 
 
 class TranslationResponseError(TranslationProviderError):

@@ -37,6 +37,7 @@ def make_context(tmp_path: Path) -> StageContext:
         llm=FakeProvider(),  # type: ignore[arg-type]
         translate=FakeProvider(),  # type: ignore[arg-type]
         tts=FakeProvider(),  # type: ignore[arg-type]
+        transcribe=FakeProvider(),  # type: ignore[arg-type]
         logger=logging.getLogger("test"),
     )
 
@@ -52,6 +53,7 @@ def test_stage_order_is_fixed() -> None:
         StageName.TRANSLATE,
         StageName.COMPOSE,
         StageName.NARRATE,
+        StageName.TRANSCRIBE,
         StageName.EXPORT,
     ]
 

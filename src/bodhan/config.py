@@ -10,7 +10,7 @@ from functools import cached_property
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -39,6 +39,13 @@ class Settings(BaseSettings):
     bodhan_transcribe_key: str = Field(default="", repr=False)
     bodhan_timeout_s: float = 60.0
     bodhan_max_retries: int = Field(default=3, ge=1)
+    # DOCUMENTATION ONLY - NOT a dynamic concurrency controller.
+    # All provider calls are intentionally serialized (sequential awaits in
+    # every stage); there is no semaphore/gather and this value is not read
+    # by any code path beyond documentation. Serialization keeps every Bodhan
+    # request within the documented per-key RPM limits by construction.
+    # Do NOT interpret this setting as active concurrency enforcement.
+    provider_max_concurrency: int = Field(default=1, ge=1, le=8)
 
     # Indic-OCR request tuning (documented options of the OCR endpoint)
     ocr_table_format: Literal["html", "markdown"] = "html"
@@ -76,11 +83,14 @@ class Settings(BaseSettings):
         """POST /v1/audio/transcriptions (model ``indic-transcribe``)."""
         return f"{self.bodhan_api_base_url}/v1/audio/transcriptions"
 
-    # --- LLM (structure / quality / translation / composition only) --------
+    # --- LLM (structure / quality / English lesson planning only) ----------
+    # The LLM never extracts text, never translates, and never writes
+    # Hindi/Tamil/Bengali or any other Indian-language content (Req 15).
     llm_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     llm_api_key: str = Field(
         default="",
         validation_alias=AliasChoices("LLM_API_KEY", "GEMINI_API_KEY"),
+        repr=False,
     )
     # Probed live (2026-11-17): gemini-2.5-* returns 404 (retired for new
     # users), gemini-3.8-flash returns persistent 503 (high demand), while
@@ -90,15 +100,49 @@ class Settings(BaseSettings):
     llm_max_retries: int = 5
 
     # --- Narration ---------------------------------------------------------
-    # Primary: Bodhan indic-speak (WAV). Fallback: edge-tts (MP3), used only
-    # for transient transport failures - never for auth/quota/validation.
+    # Bodhan indic-speak (WAV) is the ONLY narration engine - the assignment
+    # restricts alternative TTS providers, so no fallback engine exists.
     bodhan_speak_voice: str = "Kavya"
     bodhan_speak_style: str | None = None
     bodhan_speak_chunk_seconds: float = Field(default=30.0, gt=0, le=30.0)
     speak_chars_per_second: float = Field(default=13.0, gt=0)  # chunking estimate
-    edge_tts_voice: str = "hi-IN-SwaraNeural"
-    edge_tts_rate: str = "+0%"
-    edge_tts_pitch: str = "+0Hz"
+
+    # --- Back-transcription ------------------------------------------------
+    # Bodhan Indic-Transcribe is the ONLY speech-to-text engine - the
+    # assignment restricts STT providers, so no fallback engine exists.
+    # Documented gateway model id (the Core/Flex variants are the Hugging
+    # Face repositories bodhan-ai/indic-transcribe-core / -flex served
+    # behind this id, not separate gateway ids).
+    transcribe_model: str = "indic-transcribe"
+    # Documented request ceiling: 30 s of audio; longer narration segments
+    # are split client-side (WAV) and the piece texts joined verbatim.
+    transcribe_max_audio_s: float = Field(default=30.0, gt=0, le=30.0)
+
+    # --- CER evaluation (Phase 2B) -----------------------------------------
+    # Configurable quality bands, expressed as CER percentages. These are
+    # PROJECT evaluation thresholds, not official Bodhan quality standards.
+    # Excellent: <=5%; Good: >5-10%; Needs Review: >10-20%; Poor: >20%.
+    cer_excellent_max_pct: float = Field(default=5.0, ge=0.0)
+    cer_good_max_pct: float = Field(default=10.0, ge=0.0)
+    cer_review_max_pct: float = Field(default=20.0, ge=0.0)
+
+    @model_validator(mode="after")
+    def _validate_page_range(self) -> Settings:
+        if self.min_input_pages > self.max_input_pages:
+            raise ValueError("min_input_pages must not exceed max_input_pages")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_cer_thresholds(self) -> Settings:
+        if not (
+            0 <= self.cer_excellent_max_pct <= self.cer_good_max_pct <= self.cer_review_max_pct
+        ):
+            raise ValueError(
+                "CER thresholds must satisfy 0 <= excellent <= good <= review "
+                f"(got {self.cer_excellent_max_pct}, {self.cer_good_max_pct}, "
+                f"{self.cer_review_max_pct})"
+            )
+        return self
 
     # --- Translation -------------------------------------------------------
     # None = omit the optional `script` field (server default: native).
@@ -112,7 +156,11 @@ class Settings(BaseSettings):
 
     # --- Pipeline ----------------------------------------------------------
     render_dpi: int = Field(default=200, ge=72, le=600)
-    pipeline_stage_timeout_s: float = 900.0
+    # Assignment target range. The maximum is always enforced; the minimum is
+    # opt-in to keep legacy 2-page smoke fixtures runnable (see ingest.py).
+    min_input_pages: int = Field(default=5, ge=1)
+    max_input_pages: int = Field(default=30, ge=1)
+    enforce_page_count_limits: bool = False
     default_target_language: str = "hi"
 
     # --- Derived directories ----------------------------------------------

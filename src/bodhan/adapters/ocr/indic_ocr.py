@@ -19,7 +19,9 @@ Notes honoured from the docs:
 - ``max_tokens`` is a **per-block** transcription limit; a block exceeding it
   fails the page with ``502`` -> bounded recovery by raising the budget once;
 - published rate limits come from ``x-ratelimit-*`` response headers;
-- ``401`` is terminal; ``408/425/429/5xx`` retry with exponential backoff.
+- ``401`` is terminal; ``408/425/429/5xx`` retry with bounded exponential
+  backoff, honouring the documented ``retry-after`` header on ``429``
+  (4 requests/minute sliding window).
 
 Reading order is normalised locally: blocks are sorted by the provider's
 ``order`` (which the docs describe as 0-based but examples show starting at
@@ -44,6 +46,7 @@ from tenacity import (
 from bodhan.adapters.ocr.errors import OCRProviderError, OCRResponseError
 from bodhan.adapters.ocr.labels import map_label
 from bodhan.adapters.rate_limit import RateLimitInfo, read_rate_limit
+from bodhan.adapters.retry import RetryAfterWait, read_retry_after
 from bodhan.domain.models import OCRBlock, OCRResult, Page, QualityFlag
 from bodhan.observability import get_logger
 from bodhan.ports.ocr import OCRPort
@@ -180,7 +183,7 @@ class IndicOCRAdapter(OCRPort):
         try:
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(self._max_retries),
-                wait=wait_exponential(multiplier=0.5, max=20.0),
+                wait=RetryAfterWait(wait_exponential(multiplier=0.5, max=20.0)),
                 retry=retry_if_exception(_is_retryable),
                 reraise=True,
             ):
@@ -199,6 +202,7 @@ class IndicOCRAdapter(OCRPort):
                             f"Indic-OCR returned HTTP {response.status_code}: "
                             f"{response.text[:300]}",
                             status_code=response.status_code,
+                            retry_after=read_retry_after(response),
                         )
         except OCRProviderError:
             raise

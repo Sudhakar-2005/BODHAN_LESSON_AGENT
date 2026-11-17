@@ -8,7 +8,6 @@ own ``pages.json`` / artifact files, so any stage can be re-run in isolation
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +27,7 @@ INPUT_OF: dict[StageName, StageName | None] = {
     StageName.TRANSLATE: StageName.QUALITY,
     StageName.COMPOSE: StageName.TRANSLATE,
     StageName.NARRATE: StageName.COMPOSE,
+    StageName.TRANSCRIBE: StageName.NARRATE,
     StageName.EXPORT: StageName.NARRATE,
 }
 
@@ -110,18 +110,3 @@ def load_typed_list(
         return [model.model_validate(item) for item in raw]
     except ValidationError as exc:
         raise PipelineError(f"invalid records in {stage.value}/{name}") from exc
-
-
-def cached_or_compute(
-    cache_path: Path,
-    compute: Callable[[], Any],
-) -> Any:
-    """Return the cached JSON file if present, else compute and persist it."""
-    if cache_path.is_file():
-        try:
-            return json.loads(cache_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            pass  # corrupt cache: recompute
-    value = compute()
-    cache_path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    return value

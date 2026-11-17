@@ -15,6 +15,7 @@ from bodhan.domain.models import Chapter
 from bodhan.ports.artifact_store import ArtifactStore
 from bodhan.ports.llm import LLMPort
 from bodhan.ports.ocr import OCRPort
+from bodhan.ports.transcribe import TranscribePort
 from bodhan.ports.translate import TranslatePort
 from bodhan.ports.tts import TTSPort
 
@@ -30,6 +31,7 @@ class StageContext:
     llm: LLMPort
     translate: TranslatePort
     tts: TTSPort
+    transcribe: TranscribePort
     logger: logging.Logger
     # Free-form handoff between stages (e.g. OCR results -> structure).
     state: dict[str, Any] = field(default_factory=dict)

@@ -1,13 +1,17 @@
-"""Stage 9 - export: assemble the final deliverables under data/exports/.
+"""Stage 10 - export: assemble the final deliverables under data/exports/.
 
 Produces per chapter::
 
     data/exports/<chapter>/
         lesson.md            # translated lesson
         lesson.html          # rendered with embedded audio players
-        audio/seg-NN.mp3     # narration segments
+        audio/seg-NN.<ext>   # narration segments (.wav from Indic-Speak,
+                             #  the only narration engine)
         quality_report.json  # every flagged OCR block + reason
         manifest.json        # copy of the run manifest (audit trail)
+
+All visible labels in ``lesson.html`` come from the lesson scaffold
+(translated via Indic-Translate) - nothing is hardcoded per language.
 """
 
 from __future__ import annotations
@@ -44,11 +48,13 @@ _HTML_TEMPLATE = Template(
 <body>
   <h1>{{ lesson.title }}</h1>
   {% if flagged %}
-  <div class="flag">⚠ {{ flagged }} OCR block(s) were flagged during quality
-  review — see <code>quality_report.json</code>.</div>
+  <div class="flag">⚠ {{ lesson.label("quality_warning") }}
+  <code>quality_report.json</code></div>
   {% endif %}
   <div class="markdown">{{ body_html | safe }}</div>
-  <h2>पाठ का ऑडियो</h2>
+  {% if audio_label %}
+  <h2>{{ audio_label }}</h2>
+  {% endif %}
   {% for player in players %}
   <div class="segment">
     <audio controls preload="none" src="audio/{{ player.file }}"></audio>
@@ -136,6 +142,7 @@ async def run(ctx: StageContext) -> dict[str, Any]:
             body_html=_markdown_to_html(lesson.markdown),
             players=players,
             flagged=len(lesson.flagged_block_ids),
+            audio_label=lesson.label("audio"),
         ),
         encoding="utf-8",
     )

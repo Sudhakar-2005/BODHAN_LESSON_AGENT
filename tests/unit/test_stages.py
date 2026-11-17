@@ -44,6 +44,48 @@ async def test_ingest_rejects_unsupported_type(tmp_path: Path, context: StageCon
         await ingest.run(context)
 
 
+def _make_png(path: Path, *, width: int = 60, height: int = 40) -> Path:
+    """Write a small real PNG (image_size/PIL must be able to decode it)."""
+    image = np.full((height, width, 3), 255, dtype=np.uint8)
+    cv2.imwrite(str(path), image)
+    return path
+
+
+async def test_ingest_accepts_image_folder_sorted_by_name(
+    tmp_path: Path, context: StageContext
+) -> None:
+    folder = tmp_path / "pages"
+    folder.mkdir()
+    _make_png(folder / "02.png", width=80, height=50)
+    _make_png(folder / "01.png", width=60, height=40)
+    (folder / "notes.txt").write_text("not a page", encoding="utf-8")
+    context.chapter.source_path = str(folder)
+
+    result = await ingest.run(context)
+
+    assert result["pages"] == 2
+    pages = load_pages(context.store, ingest.NAME)
+    assert [page.page_index for page in pages] == [0, 1]
+    # sorted by filename: 01.png (60 wide) must become the first page
+    assert pages[0].width == 60
+    assert pages[1].width == 80
+    for page in pages:
+        assert page.image_path and Path(page.image_path).is_file()
+        assert page.source_path == str(folder)
+
+
+async def test_ingest_rejects_folder_without_page_images(
+    tmp_path: Path, context: StageContext
+) -> None:
+    folder = tmp_path / "empty"
+    folder.mkdir()
+    (folder / "notes.txt").write_text("not a page", encoding="utf-8")
+    context.chapter.source_path = str(folder)
+
+    with pytest.raises(PipelineError, match="no supported page images"):
+        await ingest.run(context)
+
+
 async def test_preprocess_cleans_every_page(context: StageContext, tmp_path: Path) -> None:
     make_pdf(Path(context.chapter.source_path), pages=2)
     await ingest.run(context)

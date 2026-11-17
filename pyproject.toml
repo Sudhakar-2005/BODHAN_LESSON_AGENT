@@ -11,9 +11,10 @@ dependencies = [
     "tenacity>=9.0",
     "jinja2>=3.1",
     "opencv-python>=4.10",
+    "numpy>=1.26",  # directly imported by the preprocess stage
     "pillow>=11.0",
     "pymupdf>=1.26",
-    "edge-tts>=7.0",
+    "pyyaml>=6.0",
     "typer>=0.15",
     "python-dotenv>=1.1",
 ]
@@ -25,6 +26,7 @@ dev = [
     "pytest-httpx>=0.34",
     "ruff>=0.9",
     "mypy>=1.14",
+    "types-pyyaml>=6.0",
 ]
 
 [project.scripts]
@@ -35,7 +37,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/bodhan"]
+packages = ["src/bodhan", "src/bodhan_lesson"]
 
 [tool.ruff]
 line-length = 100
@@ -49,11 +51,12 @@ ignore = ["E501"]
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101"]
 "src/bodhan/cli.py" = ["B008"]
+"src/bodhan_lesson/cli.py" = ["B008"]
 
 [tool.mypy]
 python_version = "3.11"
 mypy_path = "src"
-packages = ["bodhan"]
+packages = ["bodhan", "bodhan_lesson"]
 disallow_untyped_defs = true
 warn_unused_ignores = true
 warn_redundant_casts = true

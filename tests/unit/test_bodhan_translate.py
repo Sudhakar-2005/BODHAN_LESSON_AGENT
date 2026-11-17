@@ -10,10 +10,14 @@ rejection, the error envelope, and terminal vs retryable statuses.
 from __future__ import annotations
 
 import json
+import time
 
 import httpx
 import pytest
+from tenacity import RetryCallState
+from tenacity.wait import wait_exponential
 
+from bodhan.adapters.retry import RetryAfterWait
 from bodhan.adapters.translate import (
     BodhanTranslateAdapter,
     TranslationProviderError,
@@ -330,6 +334,108 @@ async def test_retries_are_bounded() -> None:
     await adapter.aclose()
 
     assert len(calls) == 2
+
+
+# --- documented 429 retry-after (8 req/min sliding window) -----------------
+
+
+def _state_with(exc: BaseException) -> RetryCallState:
+    """Build a RetryCallState whose last outcome is ``exc`` (no sleeping)."""
+    state = RetryCallState(retry_object=None, fn=None, args=(), kwargs={})  # type: ignore[arg-type]
+    state.set_exception((type(exc), exc, exc.__traceback__))
+    return state
+
+
+def test_retry_after_header_is_parsed() -> None:
+    response = httpx.Response(
+        429,
+        headers={"retry-after": "42"},
+        json={"error": {"message": "Maximum rate limit reached for the model"}},
+    )
+    exc = BodhanTranslateAdapter._error_from(response)
+    assert exc.status_code == 429
+    assert exc.retry_after == 42.0
+
+
+def test_retry_after_header_absent_or_garbage_is_none() -> None:
+    absent = BodhanTranslateAdapter._error_from(
+        httpx.Response(429, json={"error": {"message": "x"}})
+    )
+    assert absent.retry_after is None
+    weird = BodhanTranslateAdapter._error_from(
+        httpx.Response(429, headers={"retry-after": "soon"}, json={"error": {"message": "x"}})
+    )
+    assert weird.retry_after is None
+
+
+def test_wait_honours_retry_after_over_exponential_backoff() -> None:
+    """429 + retry-after must wait the provider's delay, not the 1s fallback."""
+    wait = RetryAfterWait(wait_exponential(multiplier=1.0, max=30.0))
+    exc = TranslationProviderError("translate HTTP 429: rate", status_code=429, retry_after=42.0)
+    assert wait(_state_with(exc)) == 42.0
+
+
+def test_wait_caps_absurd_retry_after() -> None:
+    """A bogus huge header cannot stall the pipeline past the cap."""
+    wait = RetryAfterWait(wait_exponential(multiplier=1.0, max=30.0))
+    exc = TranslationProviderError("translate HTTP 429: rate", status_code=429, retry_after=99999.0)
+    assert wait(_state_with(exc)) == 60.0
+
+
+def test_wait_falls_back_to_exponential_without_header() -> None:
+    """No header (or a non-retry-after error) keeps the exponential delay."""
+    wait = RetryAfterWait(wait_exponential(multiplier=1.0, max=30.0))
+    without = TranslationProviderError("translate HTTP 429: rate", status_code=429)
+    assert wait(_state_with(without)) == 1.0
+    other = TranslationProviderError("translate HTTP 503: busy", status_code=503, retry_after=None)
+    assert wait(_state_with(other)) == 1.0
+
+
+async def test_rate_limited_call_waits_out_retry_after_then_succeeds() -> None:
+    """End to end: 429 + retry-after, then 200 - and the wait was honoured."""
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if len(calls) == 1:
+            return httpx.Response(
+                429,
+                headers={"retry-after": "1.5"},
+                json={"error": {"message": "Maximum rate limit reached for the model"}},
+            )
+        return httpx.Response(200, json=chat_body())
+
+    adapter = make_chat(client=transport(handler))
+    started = time.monotonic()
+    result = await adapter.translate("hello", target_language="hi")
+    elapsed = time.monotonic() - started
+    await adapter.aclose()
+
+    assert len(calls) == 2
+    assert result.text
+    # exponential backoff alone would have waited only 1.0s
+    assert elapsed >= 1.5
+
+
+async def test_auth_error_stays_terminal_even_with_retry_after_header() -> None:
+    """403 is terminal regardless of a retry-after header (documented policy)."""
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(
+            403,
+            headers={"retry-after": "5"},
+            json={"error": {"message": "Invalid or missing authentication credentials"}},
+        )
+
+    adapter = make_chat(client=transport(handler))
+    with pytest.raises(TranslationProviderError) as exc_info:
+        await adapter.translate("hello", target_language="hi")
+    await adapter.aclose()
+
+    assert exc_info.value.status_code == 403
+    assert len(calls) == 1
 
 
 # --- product transport (POST /translate, currently 404 on the gateway) ----

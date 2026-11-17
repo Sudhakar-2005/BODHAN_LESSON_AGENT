@@ -3,7 +3,7 @@
 Stage order (BODHAN LESSON AGENT)::
 
     ingest -> preprocess -> extract -> structure -> quality
-           -> translate -> compose -> narrate -> export
+           -> translate -> compose -> narrate -> transcribe -> export
 
 Checkpointing: each completed stage writes its name and timing into the
 chapter manifest. A re-run skips stages already marked ``status == "done"``
@@ -12,13 +12,19 @@ unless ``force=True``.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
 from bodhan.domain.models import StageName
-from bodhan.observability import get_logger
+from bodhan.observability import emit_event, get_logger
+from bodhan.pipeline.checkpoint import (
+    checkpoint_verification_level,
+    stage_artifact_hashes,
+    verify_stage_artifacts,
+)
 from bodhan.pipeline.errors import PipelineError, StageNotImplementedError
 from bodhan.pipeline.stages import (
     compose,
@@ -29,6 +35,7 @@ from bodhan.pipeline.stages import (
     preprocess,
     quality,
     structure,
+    transcribe,
     translate,
 )
 from bodhan.pipeline.stages.base import StageContext
@@ -47,6 +54,7 @@ STAGES: list[tuple[StageName, StageFn]] = [
     (translate.NAME, translate.run),
     (compose.NAME, compose.run),
     (narrate.NAME, narrate.run),
+    (transcribe.NAME, transcribe.run),
     (export.NAME, export.run),
 ]
 
@@ -64,6 +72,7 @@ def _record(
     duration_s: float,
     artifacts: dict[str, Any] | None = None,
     error: str | None = None,
+    artifact_hashes: dict[str, str] | None = None,
 ) -> None:
     stages = manifest.setdefault("stages", {})
     entry: dict[str, Any] = {
@@ -75,6 +84,8 @@ def _record(
         entry["artifacts"] = artifacts
     if error:
         entry["error"] = error
+    if artifact_hashes:
+        entry["artifact_hashes"] = artifact_hashes
     stages[stage.value] = entry
 
 
@@ -106,10 +117,55 @@ async def run_pipeline(
 
     for name, fn in stages:
         if not force and _is_done(manifest, name):
-            ctx.logger.info("stage %-10s skipped (already done)", name.value)
-            continue
+            entry = manifest["stages"][name.value]
+            recorded = entry.get("artifact_hashes") if isinstance(entry, dict) else None
+            has_directory = (ctx.store.root() / name.value).is_dir()
+            # Legacy manifests without any stage artifacts are trusted (the
+            # original resume contract); new runs record hashes and are
+            # validated, and an existing directory is always checked.
+            valid, reasons = (
+                verify_stage_artifacts(ctx.store.root(), name, legacy_ok=True)
+                if has_directory or recorded
+                else (True, [])
+            )
+            verification = (
+                checkpoint_verification_level(
+                    ctx.store.root(), name, recorded if isinstance(recorded, dict) else None
+                )
+                if has_directory or recorded
+                else "legacy"  # no artifacts on disk at all: legacy, not invalid
+            )
+            if verification == "invalid":
+                valid = False
+                reasons.append("checkpoint not integrity-verified")
+            if valid:
+                emit_event(
+                    ctx.logger,
+                    "checkpoint_reused",
+                    run_id=ctx.chapter.chapter_id,
+                    stage=name.value,
+                    target_language=ctx.chapter.target_language_code,
+                    status="reused",
+                    verification=verification,  # 'verified' or 'legacy'
+                )
+                continue
+            emit_event(
+                ctx.logger,
+                "checkpoint_invalidated",
+                run_id=ctx.chapter.chapter_id,
+                stage=name.value,
+                target_language=ctx.chapter.target_language_code,
+                level=logging.WARNING,
+                reasons=sorted(reasons),
+            )
 
-        ctx.logger.info("stage %-10s started", name.value)
+        emit_event(
+            ctx.logger,
+            "stage_started",
+            run_id=ctx.chapter.chapter_id,
+            stage=name.value,
+            target_language=ctx.chapter.target_language_code,
+        )
         started = time.perf_counter()
         try:
             artifacts = await fn(ctx)
@@ -121,13 +177,38 @@ async def run_pipeline(
             duration = time.perf_counter() - started
             _record(manifest, name, status="failed", duration_s=duration, error=str(exc))
             ctx.store.write_manifest(manifest)
-            ctx.logger.exception("stage %s failed after %.2fs", name.value, duration)
+            emit_event(
+                ctx.logger,
+                "stage_failed",
+                run_id=ctx.chapter.chapter_id,
+                stage=name.value,
+                target_language=ctx.chapter.target_language_code,
+                level=logging.ERROR,
+                status="failed",
+                duration_s=round(duration, 3),
+                error=str(exc)[:200],
+            )
             raise PipelineError(f"stage '{name.value}' failed: {exc}") from exc
 
         duration = time.perf_counter() - started
-        _record(manifest, name, status="done", duration_s=duration, artifacts=artifacts)
+        _record(
+            manifest,
+            name,
+            status="done",
+            duration_s=duration,
+            artifacts=artifacts,
+            artifact_hashes=stage_artifact_hashes(ctx.store.root(), name),
+        )
         ctx.store.write_manifest(manifest)
-        ctx.logger.info("stage %-10s done in %.2fs", name.value, duration)
+        emit_event(
+            ctx.logger,
+            "stage_completed",
+            run_id=ctx.chapter.chapter_id,
+            stage=name.value,
+            target_language=ctx.chapter.target_language_code,
+            status="done",
+            duration_s=round(duration, 3),
+        )
 
     manifest["status"] = "done" if not only else manifest.get("status", "partial")
     ctx.store.write_manifest(manifest)

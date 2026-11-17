@@ -11,7 +11,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from bodhan.domain.models import BlockKind, OCRBlock, OCRResult, StageName
+from bodhan.document import (
+    analyze_continuity,
+    analyze_suppression,
+    associate_figures,
+    parse_html_tables,
+)
+from bodhan.document.models import TableGrid
+from bodhan.document.tables import merge_tables
+from bodhan.domain.models import BlockKind, OCRBlock, OCRResult, QualityFlag, StageName
 from bodhan.pipeline.errors import PipelineError
 from bodhan.pipeline.prompts import chunked, complete_json, format_payload
 from bodhan.pipeline.stages.base import StageContext
@@ -109,14 +117,74 @@ async def run(ctx: StageContext) -> dict[str, Any]:
     # Reading order was normalised per page by the OCR stage; keep it stable.
     structured.sort(key=lambda b: (b.page_index, b.reading_order))
 
-    save_json(ctx.store, NAME, "blocks.json", structured)
-    ctx.state["blocks"] = structured
+    # --- deterministic document intelligence (no LLM content generation) ---
+    active, suppressed = analyze_suppression(structured)
+    continuity = analyze_continuity(active)
+
+    grids: dict[str, TableGrid] = {}
+    for block in continuity.blocks:
+        if block.kind is BlockKind.TABLE:
+            grid = parse_html_tables(block)
+            if grid is not None:
+                grids[grid.block_id] = grid
+    consumed_tables: set[str] = set()
+    for first_id, second_id in continuity.table_pairs:
+        first, second = grids.get(first_id), grids.get(second_id)
+        if first is not None and second is not None:
+            grids[first_id] = merge_tables(first, second)
+            consumed_tables.add(second_id)
+    downstream = [block for block in continuity.blocks if block.block_id not in consumed_tables]
+
+    associations = associate_figures(downstream)
+    ambiguous_captions = {
+        item.caption_block_id for item in associations if item.figure_block_id is None
+    }
+    final_blocks = [
+        block.model_copy(
+            update={
+                "flags": list(
+                    dict.fromkeys(
+                        [*block.flags, QualityFlag.FIGURE_ASSOCIATION_AMBIGUOUS]
+                        if block.block_id in ambiguous_captions
+                        else block.flags
+                    )
+                )
+            }
+        )
+        for block in downstream
+    ]
+
+    save_json(ctx.store, NAME, "blocks.json", final_blocks)
+    save_json(ctx.store, NAME, "suppressed.json", [d.model_dump() for d in suppressed])
+    save_json(ctx.store, NAME, "continuity.json", [d.model_dump() for d in continuity.decisions])
+    save_json(
+        ctx.store, NAME, "tables.json", {key: grid.model_dump() for key, grid in grids.items()}
+    )
+    save_json(ctx.store, NAME, "figures.json", [a.model_dump() for a in associations])
+    save_json(
+        ctx.store,
+        NAME,
+        "document_intelligence.json",
+        {
+            "suppressed_blocks": len(suppressed),
+            "continuity_merges": len(continuity.decisions),
+            "tables": len(grids),
+            "incomplete_tables": sum(1 for grid in grids.values() if grid.incomplete),
+            "figure_associations": len(associations),
+            "ambiguous_associations": len(ambiguous_captions),
+        },
+    )
+    ctx.state["blocks"] = final_blocks
 
     by_kind: dict[str, int] = {}
-    for block in structured:
+    for block in final_blocks:
         by_kind[block.kind.value] = by_kind.get(block.kind.value, 0) + 1
     return {
-        "blocks": len(structured),
+        "blocks": len(final_blocks),
         "llm_classified": len(updates),
         "by_kind": by_kind,
+        "suppressed_blocks": len(suppressed),
+        "continuity_merges": len(continuity.decisions),
+        "tables": len(grids),
+        "figure_associations": len(associations),
     }

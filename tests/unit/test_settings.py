@@ -36,10 +36,48 @@ def test_keys_never_appear_in_repr_or_str() -> None:
         bodhan_translate_key=secret,
         bodhan_speak_key=secret,
         bodhan_transcribe_key=secret,
+        llm_api_key=secret,
     )
 
     for printable in (repr(settings), str(settings), f"{settings}"):
         assert secret not in printable
+
+    # Provider wiring still receives the real values; only representations
+    # (logs, tracebacks, exception messages) are redacted.
+    assert settings.llm_api_key == secret
+    assert settings.bodhan_ocr_key == secret
+
+
+def test_llm_key_redaction_survives_model_copy_and_validation_errors() -> None:
+    """repr=False must survive model_copy (used for per-language settings)."""
+    secret = "gemini-super-secret"
+    settings = Settings(llm_api_key=secret)
+    copied = settings.model_copy(update={"bodhan_speak_voice": "Kavya"})
+
+    for printable in (repr(settings), repr(copied), str(copied)):
+        assert secret not in printable
+    assert copied.llm_api_key == secret
+
+    try:
+        Settings(cer_excellent_max_pct=10.0, cer_good_max_pct=5.0)
+    except ValueError as exc:
+        assert secret not in str(exc)
+    else:  # pragma: no cover - the validator must reject this combination
+        raise AssertionError("invalid CER thresholds were accepted")
+
+
+def test_env_example_contains_placeholders_only() -> None:
+    """Tracked configuration must never contain credential values."""
+    from pathlib import Path
+
+    example = Path(__file__).resolve().parents[2] / ".env.example"
+    for line in example.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        if any(token in key.upper() for token in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
+            assert not value.strip(), f"{key} has a non-empty value in .env.example"
 
 
 def test_documented_endpoints_are_derived_from_base() -> None:

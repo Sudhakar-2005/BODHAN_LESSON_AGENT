@@ -63,6 +63,7 @@ def _build_context(
         llm=providers.llm,
         translate=providers.translate,
         tts=providers.tts,
+        transcribe=providers.transcribe,
         logger=get_logger("bodhan.pipeline"),
     )
     return ctx, providers

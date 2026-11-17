@@ -5,10 +5,14 @@ the pipeline, so tests can substitute fakes in one place.
 
 Provider matrix (approved):
 - OCR      : Bodhan Indic-OCR only (no alternative engine, ever)
-- Translate: Bodhan POST /translate
-- Narrate  : Bodhan indic-speak (primary) -> edge-tts (transient failures only)
-- LLM      : Gemini for structure (ambiguous cases), quality and composition
-- Transcribe: reserved for Phase 2 (no stage, no adapter in this DAG)
+- Translate: Bodhan Indic-Translate (all target-language text originates here)
+- Narrate  : Bodhan indic-speak only (the assignment restricts alternative
+             TTS providers - there is no fallback engine, ever)
+- LLM      : Gemini for structure (ambiguous cases), quality and English-only
+             lesson planning - never extraction, translation or Indian-language
+             authoring
+- Transcribe: Bodhan Indic-Transcribe only (back-transcription of narrated
+              audio - no alternative STT provider, ever)
 """
 
 from __future__ import annotations
@@ -17,13 +21,13 @@ from dataclasses import dataclass
 
 from bodhan.adapters.llm.gemini import GeminiLLMAdapter
 from bodhan.adapters.ocr.indic_ocr import IndicOCRAdapter
+from bodhan.adapters.transcribe.indic_transcribe import BodhanTranscribeAdapter
 from bodhan.adapters.translate.bodhan import BodhanTranslateAdapter
 from bodhan.adapters.tts.bodhan_speak import BodhanSpeakAdapter
-from bodhan.adapters.tts.edge_tts import EdgeTTSAdapter
-from bodhan.adapters.tts.fallback import FallbackTTS
 from bodhan.config import Settings
 from bodhan.ports.llm import LLMPort
 from bodhan.ports.ocr import OCRPort
+from bodhan.ports.transcribe import TranscribePort
 from bodhan.ports.translate import TranslatePort
 from bodhan.ports.tts import TTSPort
 
@@ -34,18 +38,20 @@ class Providers:
     llm: LLMPort
     translate: TranslatePort
     tts: TTSPort
+    transcribe: TranscribePort
 
     async def aclose(self) -> None:
-        for provider in (self.ocr, self.llm, self.translate, self.tts):
+        for provider in (self.ocr, self.llm, self.translate, self.tts, self.transcribe):
             await provider.aclose()
 
 
 def build_providers(settings: Settings, *, target_language: str | None = None) -> Providers:
     """Instantiate the production provider set.
 
-    NOTE: Indic-OCR is the only OCR engine -- no fallback is ever constructed.
-    Narration falls back to edge-tts only for transient transport failures;
-    auth/quota/validation errors propagate (see ``FallbackTTS``).
+    NOTE: Indic-OCR is the only OCR engine and Indic-Speak is the only
+    narration engine - no alternative provider is ever constructed
+    (the assignment restricts alternative TTS providers). Transient
+    speak failures are handled by bounded retries inside the adapter.
     """
     speak_lang = target_language or settings.default_target_language
     return Providers(
@@ -78,22 +84,23 @@ def build_providers(settings: Settings, *, target_language: str | None = None) -
             timeout_s=settings.bodhan_timeout_s,
             max_retries=settings.bodhan_max_retries,
         ),
-        tts=FallbackTTS(
-            primary=BodhanSpeakAdapter(
-                base_url=settings.bodhan_speak_endpoint,
-                api_key=settings.bodhan_speak_key,
-                voice=settings.bodhan_speak_voice,
-                lang=speak_lang,
-                style=settings.bodhan_speak_style,
-                chunk_seconds=settings.bodhan_speak_chunk_seconds,
-                chars_per_second=settings.speak_chars_per_second,
-                timeout_s=settings.bodhan_timeout_s,
-                max_retries=settings.bodhan_max_retries,
-            ),
-            fallback=EdgeTTSAdapter(
-                voice=settings.edge_tts_voice,
-                rate=settings.edge_tts_rate,
-                pitch=settings.edge_tts_pitch,
-            ),
+        tts=BodhanSpeakAdapter(
+            base_url=settings.bodhan_speak_endpoint,
+            api_key=settings.bodhan_speak_key,
+            voice=settings.bodhan_speak_voice,
+            lang=speak_lang,
+            style=settings.bodhan_speak_style,
+            chunk_seconds=settings.bodhan_speak_chunk_seconds,
+            chars_per_second=settings.speak_chars_per_second,
+            timeout_s=settings.bodhan_timeout_s,
+            max_retries=settings.bodhan_max_retries,
+        ),
+        transcribe=BodhanTranscribeAdapter(
+            base_url=settings.bodhan_transcribe_endpoint,
+            api_key=settings.bodhan_transcribe_key,
+            model=settings.transcribe_model,
+            timeout_s=settings.bodhan_timeout_s,
+            max_retries=settings.bodhan_max_retries,
+            max_audio_seconds=settings.transcribe_max_audio_s,
         ),
     )

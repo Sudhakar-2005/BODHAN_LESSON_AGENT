@@ -1,8 +1,10 @@
 """Contract tests for the Bodhan ``POST /v1/audio/speech`` adapter + policy.
 
 Covers the documented request (``instructions`` as a JSON string), WAV
-handling (chunking + concatenation), and the strict fallback policy:
-never fall back for auth/quota/validation, only for transient 5xx/transport.
+handling (chunking + concatenation), and the single-engine retry policy:
+bounded retries for transient failures (honouring ``retry-after``), terminal
+auth/validation errors, and the guarantee that no fallback TTS provider
+exists anywhere in the package (assignment: Indic-Speak only).
 """
 
 from __future__ import annotations
@@ -17,14 +19,11 @@ import pytest
 
 from bodhan.adapters.tts import (
     BodhanSpeakAdapter,
-    FallbackTTS,
     TTSProviderError,
     TTSResponseError,
-    should_fallback,
     split_for_speech,
 )
 from bodhan.domain.models import AudioSegment
-from bodhan.ports.tts import TTSPort
 
 BASE_URL = "https://api.test/v1/audio/speech"
 
@@ -245,7 +244,8 @@ async def test_validation_error_is_terminal(tmp_path: Path) -> None:
     assert len(calls) == 1
 
 
-async def test_rate_limit_error_is_terminal(tmp_path: Path) -> None:
+async def test_quota_429_without_retry_after_is_terminal(tmp_path: Path) -> None:
+    """Out-of-credit 429 (no documented ``retry-after``) must not retry."""
     calls: list[int] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -260,6 +260,7 @@ async def test_rate_limit_error_is_terminal(tmp_path: Path) -> None:
     await adapter.aclose()
 
     assert exc_info.value.status_code == 429
+    assert exc_info.value.retry_after is None
     assert len(calls) == 1
 
 
@@ -283,111 +284,89 @@ async def test_transient_5xx_is_retried_then_raises(tmp_path: Path) -> None:
     assert len(calls) == 2
 
 
-# --- fallback policy ------------------------------------------------------
+# --- single-engine retry policy + no-fallback guarantees ------------------
 
 
-def test_should_fallback_only_for_transient_failures() -> None:
-    # Transient: allowed.
-    assert should_fallback(httpx.ConnectError("boom"))
-    assert should_fallback(httpx.ReadTimeout("slow"))
-    for status in (408, 425, 500, 502, 503, 504):
-        assert should_fallback(TTSProviderError("x", status_code=status))
+async def test_rate_limit_429_with_retry_after_is_retried(tmp_path: Path) -> None:
+    """Documented rate-limit 429 (with ``retry-after``) waits out the window."""
+    calls: list[int] = []
 
-    # Auth / quota / validation / unknown: NEVER.
-    for status in (400, 401, 403, 413, 422, 429):
-        assert not should_fallback(TTSProviderError("x", status_code=status))
-    assert not should_fallback(TTSProviderError("no status"))
-    assert not should_fallback(ValueError("bad input"))
-    assert not should_fallback(RuntimeError("surprise"))
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if len(calls) < 2:
+            return httpx.Response(429, json={"message": "rate limit"}, headers={"retry-after": "0"})
+        return httpx.Response(200, content=make_wav(), headers={"content-type": "audio/wav"})
 
-
-class _StubTTS(TTSPort):
-    """Records calls; optionally raises a configured exception."""
-
-    def __init__(self, exc: BaseException | None = None) -> None:
-        self.exc = exc
-        self.calls: list[str] = []
-
-    async def synthesize(
-        self, text: str, *, segment_id: str, lesson_id: str, output_path: Path
-    ) -> AudioSegment:
-        self.calls.append(segment_id)
-        if self.exc is not None:
-            raise self.exc
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(b"audio")
-        return AudioSegment(
-            segment_id=segment_id, lesson_id=lesson_id, text=text, audio_path=str(output_path)
-        )
-
-
-async def test_fallback_used_for_transient_5xx(tmp_path: Path) -> None:
-    primary = _StubTTS(TTSProviderError("boom", status_code=502))
-    fallback = _StubTTS()
-    wrapper = FallbackTTS(primary, fallback)
-
-    segment = await wrapper.synthesize(
-        "hello", segment_id="seg-01", lesson_id="l1", output_path=tmp_path / "a.wav"
+    adapter = make_adapter(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    segment = await adapter.synthesize(
+        "hello.", segment_id="seg-01", lesson_id="lesson-01", output_path=tmp_path / "x.wav"
     )
-    await wrapper.aclose()
+    await adapter.aclose()
 
-    assert primary.calls == ["seg-01"]
-    assert fallback.calls == ["seg-01"]
+    assert len(calls) == 2
     assert Path(segment.audio_path).is_file()
 
 
-@pytest.mark.parametrize("status", [401, 403, 429, 400, 413, 422])
-async def test_fallback_never_used_for_auth_quota_validation(tmp_path: Path, status: int) -> None:
-    primary = _StubTTS(TTSProviderError("nope", status_code=status))
-    fallback = _StubTTS()
-    wrapper = FallbackTTS(primary, fallback)
+async def test_rate_limit_429_retries_are_bounded(tmp_path: Path) -> None:
+    """Even a persistent rate limit cannot loop forever (bounded budget)."""
+    calls: list[int] = []
 
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(429, json={"message": "rate limit"}, headers={"retry-after": "0"})
+
+    adapter = make_adapter(
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)), max_retries=2
+    )
     with pytest.raises(TTSProviderError) as exc_info:
-        await wrapper.synthesize(
-            "hello", segment_id="seg-01", lesson_id="l1", output_path=tmp_path / "a.wav"
+        await adapter.synthesize(
+            "hello.", segment_id="seg-01", lesson_id="lesson-01", output_path=tmp_path / "x.wav"
         )
-    await wrapper.aclose()
+    await adapter.aclose()
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.retry_after == 0.0
+    assert len(calls) == 2  # initial attempt + one bounded retry
+
+
+@pytest.mark.parametrize("status", [400, 403, 413])
+async def test_validation_and_forbidden_statuses_are_never_retried(
+    tmp_path: Path, status: int
+) -> None:
+    """400/403/413 fail on the first attempt - no indiscriminate retries."""
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(status, json={"message": "nope"})
+
+    adapter = make_adapter(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    with pytest.raises(TTSProviderError) as exc_info:
+        await adapter.synthesize(
+            "hello.", segment_id="seg-01", lesson_id="lesson-01", output_path=tmp_path / "x.wav"
+        )
+    await adapter.aclose()
 
     assert exc_info.value.status_code == status
-    assert fallback.calls == []  # fallback was never invoked
+    assert len(calls) == 1
 
 
-async def test_fallback_never_used_for_unexpected_errors(tmp_path: Path) -> None:
-    primary = _StubTTS(RuntimeError("bug"))
-    fallback = _StubTTS()
-    wrapper = FallbackTTS(primary, fallback)
+def test_no_fallback_provider_module_exists() -> None:
+    """edge-tts and the fallback wrapper were deleted - nothing can import them."""
+    import importlib.util
 
-    with pytest.raises(RuntimeError, match="bug"):
-        await wrapper.synthesize(
-            "hello", segment_id="seg-01", lesson_id="l1", output_path=tmp_path / "a.wav"
-        )
-    await wrapper.aclose()
-
-    assert fallback.calls == []
+    for module in ("bodhan.adapters.tts.edge_tts", "bodhan.adapters.tts.fallback"):
+        assert importlib.util.find_spec(module) is None, module
 
 
-async def test_fallback_wrapper_exposes_primary_extension(tmp_path: Path) -> None:
-    wrapper = FallbackTTS(make_adapter(), _StubTTS())
-    assert wrapper.extension == ".wav"
+def test_tts_package_exports_no_fallback_symbols() -> None:
+    import bodhan.adapters.tts as tts_package
+
+    for symbol in ("FallbackTTS", "EdgeTTSAdapter", "should_fallback"):
+        assert not hasattr(tts_package, symbol), symbol
 
 
-async def test_fallback_count_tracks_actual_fallback_events(tmp_path: Path) -> None:
-    primary = _StubTTS(TTSProviderError("boom", status_code=503))
-    fallback = _StubTTS()
-    wrapper = FallbackTTS(primary, fallback)
+def test_tts_port_has_no_fallback_api() -> None:
+    from bodhan.ports.tts import TTSPort
 
-    assert wrapper.fallback_count == 0
-    await wrapper.synthesize(
-        "hello", segment_id="seg-01", lesson_id="l1", output_path=tmp_path / "a.wav"
-    )
-    assert wrapper.fallback_count == 1
-
-    # Auth failures never fall back, so the counter must not move.
-    failing = FallbackTTS(_StubTTS(TTSProviderError("no", status_code=401)), _StubTTS())
-    with pytest.raises(TTSProviderError):
-        await failing.synthesize(
-            "hello", segment_id="seg-02", lesson_id="l1", output_path=tmp_path / "b.wav"
-        )
-    assert failing.fallback_count == 0
-    await wrapper.aclose()
-    await failing.aclose()
+    assert not hasattr(TTSPort, "fallback_count")

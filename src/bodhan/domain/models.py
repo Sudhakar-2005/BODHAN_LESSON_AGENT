@@ -25,6 +25,7 @@ class StageName(StrEnum):
     TRANSLATE = "translate"
     COMPOSE = "compose"
     NARRATE = "narrate"
+    TRANSCRIBE = "transcribe"
     EXPORT = "export"
 
 
@@ -50,6 +51,7 @@ class QualityFlag(StrEnum):
     SUSPECTED_GARBLED = "suspected_garbled"
     READING_ORDER_AMBIGUOUS = "reading_order_ambiguous"
     UNTRANSLATABLE = "untranslatable"
+    FIGURE_ASSOCIATION_AMBIGUOUS = "figure_association_ambiguous"
 
 
 class OCRBlock(BaseModel):
@@ -63,6 +65,9 @@ class OCRBlock(BaseModel):
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     bbox: tuple[float, float, float, float] | None = None
     flags: list[QualityFlag] = Field(default_factory=list)
+    # Provenance of blocks merged by document-level continuity analysis.
+    # Empty for ordinary OCR blocks (fully backward compatible).
+    source_block_ids: list[str] = Field(default_factory=list)
     # Raw provider metadata preserved verbatim (documented OCR fields).
     provider_label: str | None = None
     provider_type: str | None = None
@@ -113,6 +118,28 @@ class Chapter(BaseModel):
     pages: list[Page] = Field(default_factory=list)
     language_code: str = "unknown"
     target_language_code: str = "unknown"
+    # Optional user-provided glossary seeds (English terms the lesson must
+    # cover) - supplied by the assignment CLI's --glossary option and handed
+    # to the lesson planner as required glossary entries.
+    glossary_seeds: list[dict[str, str]] = Field(default_factory=list)
+
+
+class ScaffoldItem(BaseModel):
+    """One non-block lesson text unit with full translation provenance.
+
+    Every item is authored in English (by the LLM planner or as a fixed UI
+    label) and translated by Bodhan Indic-Translate. ``source_en`` -> ``text``
+    plus ``provider``/``usage`` make the target-language string traceable to
+    the translation call that produced it.
+    """
+
+    item_id: str
+    kind: str  # title|label|section_heading|objective|summary|glossary_*|exercise_*|narration
+    source_en: str
+    text: str
+    provider: str = "bodhan-translate"
+    usage: dict[str, int] = Field(default_factory=dict)
+    related_block_ids: list[str] = Field(default_factory=list)
 
 
 class Lesson(BaseModel):
@@ -125,6 +152,19 @@ class Lesson(BaseModel):
     source_language_code: str
     target_language_code: str
     flagged_block_ids: list[str] = Field(default_factory=list)
+    scaffold: list[ScaffoldItem] = Field(default_factory=list)
+
+    def label(self, key: str, default: str = "") -> str:
+        """Target-language UI label (translated via Indic-Translate).
+
+        Returns ``default`` when the label was never translated (legacy
+        lessons composed before the scaffold existed).
+        """
+        item_id = f"label:{key}"
+        for item in self.scaffold:
+            if item.kind == "label" and item.item_id == item_id:
+                return item.text
+        return default
 
 
 class AudioSegment(BaseModel):
