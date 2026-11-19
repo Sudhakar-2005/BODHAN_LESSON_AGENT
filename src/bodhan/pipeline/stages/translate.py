@@ -20,13 +20,16 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from bodhan.document import (
     TableGrid,
-    protect_math,
+    preserve_math_only,
+    prose_to_translate,
+    reassemble,
     render_table_markdown,
-    validate_placeholders,
+    segment_mixed_text,
+    validate_math_spans,
 )
 from bodhan.domain.models import BlockKind, OCRBlock, StageName
 from bodhan.observability import emit_event
@@ -40,7 +43,14 @@ NAME = StageName.TRANSLATE
 
 #: Never sent to the translation API - copied through unchanged.
 _VERBATIM_KINDS = {BlockKind.EQUATION}
-_PLACEHOLDER = re.compile(r"\ue000\d+\ue001")
+
+#: Stage-level status semantics (recorded in the manifest and stage summary):
+#:   completed - every required block has a usable translation (or an
+#:               intentional empty/verbatim result); no failures;
+#:   partial   - at least one block failed, but some translations were produced;
+#:               downstream stages MUST NOT treat this as a reusable checkpoint;
+#:   failed    - no usable translation was produced; downstream must not run.
+StageStatus = Literal["completed", "partial", "failed"]
 
 
 def _safe_name(block_id: str) -> str:
@@ -90,32 +100,57 @@ def _load_blocks(ctx: StageContext) -> list[OCRBlock]:
 
 
 async def _translate_text(ctx: StageContext, text: str, target: str) -> dict[str, Any]:
-    """Translate one string, returning usage and validated restored text."""
-    protected, mapping, uncertain = protect_math(text)
-    if uncertain:
+    """Translate prose spans only; preserve math spans byte-for-byte.
+
+    The provider never receives mathematical content, so it cannot strip or
+    alter it. Every math span is verified after deterministic reconstruction;
+    ambiguous or corrupt boundaries fail safely with an explicit reason.
+    """
+    segments, ambiguous = segment_mixed_text(text)
+    if ambiguous:
         emit_event(
             ctx.logger,
-            "math_delimiters_uncertain",
+            "math_boundaries_ambiguous",
             run_id=ctx.chapter.chapter_id,
             stage=NAME.value,
             target_language=target,
             level=logging.WARNING,
-            status="preserved",
+            status="failed_safe",
         )
-    placeholders = _PLACEHOLDER.findall(protected)
-    residual = _PLACEHOLDER.sub("", protected).strip()
-    if placeholders and not residual:
-        return {"text": text, "usage": {}, "api_called": False}  # math-only
-    result = await ctx.translate.translate(protected, target_language=target)
-    if not hasattr(result, "text") or not isinstance(result.text, str):
-        raise PipelineError("translation response missing text")
-    restored, error = validate_placeholders(result.text, mapping)
+        raise PipelineError("ambiguous mathematical boundaries (unbalanced delimiters)")
+
+    math_spans = [segment.text for segment in segments if segment.kind == "math"]
+    if not prose_to_translate(segments):
+        # Math-only (or whitespace-only) blocks never reach the provider.
+        return {
+            "text": text,
+            "usage": {},
+            "api_called": False,
+            "math_only": preserve_math_only(text),
+            "math_span_count": len(math_spans),
+        }
+
+    translated_chunks: list[str] = []
+    usage: dict[str, Any] = {}
+    for prose in prose_to_translate(segments):
+        result = await ctx.translate.translate(prose, target_language=target)
+        if not isinstance(getattr(result, "text", None), str):
+            raise PipelineError("translation response missing text")
+        translated_chunks.append(result.text)
+        for key, value in (getattr(result, "usage", {}) or {}).items():
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                usage[key] = usage.get(key, 0) + value
+
+    rebuilt = reassemble(segments, translated_chunks)
+    error, verified = validate_math_spans(segments, rebuilt)
     if error is not None:
         raise PipelineError(f"invalid translation response: {error}")
     return {
-        "text": restored or "",
-        "usage": dict(getattr(result, "usage", {}) or {}),
+        "text": rebuilt,
+        "usage": usage,
         "api_called": True,
+        "math_spans_verified": verified,
+        "math_span_count": len(math_spans),
     }
 
 
@@ -283,6 +318,9 @@ async def run(ctx: StageContext) -> dict[str, Any]:
             "usage": outcome.get("usage", {}),
             "provider": getattr(ctx.translate, "provider", "unknown"),
             "model": ctx.settings.translate_model,
+            # New field; absent in legacy checkpoints, which stay reusable.
+            "translation_strategy": "span-split-v1",
+            "math_span_count": int(outcome.get("math_span_count", 0)),
         }
         if outcome.get("table"):
             checkpoint["table"] = outcome["table"]
@@ -304,11 +342,13 @@ async def run(ctx: StageContext) -> dict[str, Any]:
             # A failed block must never leave a stale successful translation.
             translations.pop(block_id, None)
 
-    if not translations and blocks:
-        raise PipelineError(
-            f"no block translated successfully ({len(failed)} failed); "
-            "failed block ids are recorded under translate/blocks/"
-        )
+    stage_status: StageStatus
+    if not translations:
+        stage_status = "failed"
+    elif failed:
+        stage_status = "partial"
+    else:
+        stage_status = "completed"
 
     save_json(
         ctx.store,
@@ -316,12 +356,14 @@ async def run(ctx: StageContext) -> dict[str, Any]:
         "translations.json",
         {
             "target_language": target,
+            "status": stage_status,
             "items": translations,
             "usage": usage_totals,
             "verbatim_blocks": verbatim,
             "empty_blocks": empty,
             "reused_blocks": reused,
             "failed_blocks": failed,
+            "translation_strategy": "span-split-v1",
         },
     )
     save_json(
@@ -335,7 +377,8 @@ async def run(ctx: StageContext) -> dict[str, Any]:
         },
     )
     ctx.state["translations"] = translations
-    return {
+    result: dict[str, Any] = {
+        "status": stage_status,
         "blocks": len(translations),
         "target_language": target,
         "verbatim_blocks": verbatim,
@@ -345,3 +388,11 @@ async def run(ctx: StageContext) -> dict[str, Any]:
         "table_cells_translated": table_cells,
         "usage": usage_totals,
     }
+    if stage_status == "failed":
+        # Evidence is already persisted; a failed stage is never a reusable
+        # checkpoint and downstream stages must not be allowed to run.
+        raise PipelineError(
+            f"translation failed for every block ({len(failed)} failed); "
+            "failed block ids are recorded under translate/blocks/"
+        )
+    return result

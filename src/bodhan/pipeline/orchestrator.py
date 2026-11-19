@@ -191,10 +191,15 @@ async def run_pipeline(
             raise PipelineError(f"stage '{name.value}' failed: {exc}") from exc
 
         duration = time.perf_counter() - started
+        # A stage may explicitly report a non-success outcome (e.g. translate
+        # reporting "partial"). Such a status must never become a reusable
+        # "done" checkpoint - only "done" is skipped by _is_done.
+        reported = artifacts.get("status") if isinstance(artifacts, dict) else None
+        stage_status = reported if reported in {"partial", "failed"} else "done"
         _record(
             manifest,
             name,
-            status="done",
+            status=stage_status,
             duration_s=duration,
             artifacts=artifacts,
             artifact_hashes=stage_artifact_hashes(ctx.store.root(), name),
@@ -206,9 +211,25 @@ async def run_pipeline(
             run_id=ctx.chapter.chapter_id,
             stage=name.value,
             target_language=ctx.chapter.target_language_code,
-            status="done",
+            status=stage_status,
             duration_s=round(duration, 3),
         )
+        if stage_status != "done":
+            emit_event(
+                ctx.logger,
+                "pipeline_halted",
+                run_id=ctx.chapter.chapter_id,
+                stage=name.value,
+                target_language=ctx.chapter.target_language_code,
+                level=logging.WARNING,
+                status=stage_status,
+            )
+            manifest["status"] = stage_status
+            ctx.store.write_manifest(manifest)
+            raise PipelineError(
+                f"stage '{name.value}' reported status '{stage_status}'; "
+                "downstream stages were not run and artifacts were preserved"
+            )
 
     manifest["status"] = "done" if not only else manifest.get("status", "partial")
     ctx.store.write_manifest(manifest)

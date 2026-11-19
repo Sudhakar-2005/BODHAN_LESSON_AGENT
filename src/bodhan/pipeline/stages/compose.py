@@ -276,6 +276,15 @@ def _load_blocks(ctx: StageContext) -> list[OCRBlock]:
 
 def _load_translations(ctx: StageContext) -> dict[str, str]:
     payload = load_json(ctx.store, StageName.TRANSLATE, "translations.json")
+    if isinstance(payload, dict):
+        status = payload.get("status")
+        failed = payload.get("failed_blocks", [])
+        if status in {"partial", "failed"} or failed:
+            ids = sorted(str(item.get("block_id")) for item in failed if isinstance(item, dict))
+            raise PipelineError(
+                f"translation stage is '{status or 'partial'}' with unresolved block(s): "
+                f"{ids[:8]}; re-run translate before composing"
+            )
     items = payload.get("items", {}) if isinstance(payload, dict) else {}
     return {str(k): str(v) for k, v in items.items()}
 

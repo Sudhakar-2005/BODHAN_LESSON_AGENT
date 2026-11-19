@@ -5,7 +5,17 @@ traceable to OCR block ids and recorded by the structure stage.
 """
 
 from bodhan.document.continuity import analyze_continuity
-from bodhan.document.equations import protect_math, restore_math, validate_placeholders
+from bodhan.document.equations import (
+    TextSegment,
+    preserve_math_only,
+    prose_to_translate,
+    protect_math,
+    reassemble,
+    restore_math,
+    segment_mixed_text,
+    validate_math_spans,
+    validate_placeholders,
+)
 from bodhan.document.figures import associate_figures
 from bodhan.document.models import (
     ContinuityDecision,
@@ -23,12 +33,18 @@ __all__ = [
     "SuppressionDecision",
     "TableCell",
     "TableGrid",
+    "TextSegment",
     "analyze_continuity",
     "analyze_suppression",
     "associate_figures",
     "parse_html_tables",
+    "preserve_math_only",
+    "prose_to_translate",
     "protect_math",
+    "reassemble",
     "render_table_markdown",
     "restore_math",
+    "segment_mixed_text",
+    "validate_math_spans",
     "validate_placeholders",
 ]

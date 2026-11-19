@@ -117,25 +117,27 @@ async def test_interrupted_rerun_reuses_valid_checkpoints(tmp_path: Path) -> Non
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("response", "reason"),
+    "response",
     [
-        ({"text": "missing placeholder"}, "missing"),
-        ({"text": "\ue0000\ue001 \ue0000\ue001 duplicate"}, "duplicated"),
+        {"text": "the value is 5"},
+        {"text": "\ue0000\ue001 \ue0000\ue001 duplicate"},
     ],
 )
-async def test_invalid_placeholder_responses_are_rejected(
-    tmp_path: Path, response: dict[str, Any], reason: str
+async def test_math_is_preserved_when_provider_returns_altered_text(
+    tmp_path: Path, response: dict[str, Any]
 ) -> None:
+    """Span-split translation never sends math to the provider, so even a
+    provider that returns placeholder-like or altered text cannot corrupt the
+    mathematical span; it is verified byte-for-byte on reconstruction."""
     ctx = seed(tmp_path, [block("p0-b0", "Value $x^2$ here")])
     ctx.translate = ScriptedTranslate(lambda text, call: response)  # type: ignore[assignment]
 
-    with pytest.raises(PipelineError, match="no block translated"):
-        await translate_stage.run(ctx)
+    result = await translate_stage.run(ctx)
 
+    assert result["status"] == "completed"
     checkpoint = record(ctx, "p0-b0")
-    assert checkpoint["status"] == "failed"
-    assert reason in checkpoint["error"]
-    assert "protected placeholders changed" in checkpoint["error"]
+    assert checkpoint["status"] == "ok"
+    assert "$x^2$" in checkpoint["translation"]
 
 
 @pytest.mark.asyncio
@@ -143,7 +145,7 @@ async def test_malformed_provider_response_is_isolated(tmp_path: Path) -> None:
     ctx = seed(tmp_path, [block("p0-b0", "alpha")])
     ctx.translate = ScriptedTranslate(lambda text, call: {"text": None})  # type: ignore[assignment]
 
-    with pytest.raises(PipelineError, match="no block translated"):
+    with pytest.raises(PipelineError, match="translation failed for every block"):
         await translate_stage.run(ctx)
     assert "missing text" in record(ctx, "p0-b0")["error"]
 
