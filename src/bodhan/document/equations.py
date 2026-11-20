@@ -10,6 +10,7 @@ is involved. Unbalanced delimiters are reported instead of being silently
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
 from typing import Literal
 
@@ -83,9 +84,28 @@ def segment_mixed_text(text: str) -> tuple[list[TextSegment], bool]:
             and prefix.group(1) in _TEXT_COMMANDS
             and len(span) > len(prefix.group(0))
         ):
-            # Keep only the command token as math; its brace argument is prose.
-            end = start + len(prefix.group(0))
-            span = prefix.group(0)
+            command = prefix.group(0)
+            remainder = span[len(command) :]
+            if remainder.startswith("{"):
+                close = remainder.find("}")
+                if close > 0:
+                    # Protect the command delimiters; translate only its prose
+                    # argument. The braces are restored deterministically, so
+                    # the command stays intact regardless of provider output.
+                    if start > cursor:
+                        segments.append(TextSegment(kind="prose", text=text[cursor:start]))
+                    segments.append(TextSegment(kind="math", text=f"{command}{{"))
+                    argument = remainder[1:close]
+                    if argument:
+                        segments.append(TextSegment(kind="prose", text=argument))
+                    segments.append(TextSegment(kind="math", text="}"))
+                    cursor = start + len(command) + close + 2
+                    continue
+            # Fallback: command without a simple brace argument.
+            end = start + len(command)
+            span = command
+        else:
+            end = match.end()
         if start > cursor:
             segments.append(TextSegment(kind="prose", text=text[cursor:start]))
         segments.append(TextSegment(kind="math", text=span))
@@ -122,24 +142,37 @@ def reassemble(segments: list[TextSegment], translated_prose: list[str]) -> str:
 
 
 def validate_math_spans(segments: list[TextSegment], rebuilt: str) -> tuple[str | None, int]:
-    """Verify every math span survived byte-for-byte, in order, exactly once.
+    """Verify every math span survived byte-for-byte, in order, with its count.
 
-    Returns ``(error, verified_count)``. This is the post-reconstruction
-    counterpart of :func:`validate_placeholders`: the provider never sees math,
-    so any alteration is a defect in our own reconstruction and must fail.
+    Repeated identical spans are legitimate in textbook text, so validation is
+    a multiset check (each distinct span must occur exactly as many times as in
+    the source) followed by an ordered-sequence check on the spans scanned
+    from the rebuilt string. Missing, extra, reordered or altered spans all
+    fail; the provider never sees math, so such changes are reconstruction
+    defects.
+
+    Returns ``(error, verified_count)``.
     """
     expected = [segment.text for segment in segments if segment.kind == "math"]
-    cursor = 0
-    verified = 0
-    for span in expected:
-        position = rebuilt.find(span, cursor)
-        if position < 0:
+    expected_counts = Counter(expected)
+    # Use the same segmentation (including text-command delimiter splitting)
+    # on the rebuilt text, so validation compares like with like.
+    rebuilt_segments, _ambiguous = segment_mixed_text(rebuilt)
+    found = [segment.text for segment in rebuilt_segments if segment.kind == "math"]
+    found_counts = Counter(found)
+
+    for span, count in expected_counts.items():
+        if found_counts.get(span, 0) < count:
+            verified = sum(min(found_counts.get(item, 0), n) for item, n in expected_counts.items())
             return f"math span missing or altered after reconstruction: {span[:80]!r}", verified
-        if rebuilt.find(span, position + len(span)) >= 0:
-            return f"math span duplicated after reconstruction: {span[:80]!r}", verified
-        cursor = position + len(span)
-        verified += 1
-    return None, verified
+    extra = found_counts - expected_counts
+    if extra:
+        span = sorted(extra)[0]
+        verified = sum(min(found_counts.get(item, 0), n) for item, n in expected_counts.items())
+        return f"extra math span introduced during reconstruction: {span[:80]!r}", verified
+    if found != expected:
+        return "math spans reordered after reconstruction", len(expected)
+    return None, len(expected)
 
 
 def preserve_math_only(text: str) -> bool:

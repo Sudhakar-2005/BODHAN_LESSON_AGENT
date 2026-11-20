@@ -10,8 +10,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from bodhan.domain.models import StageName
-from bodhan.pipeline import run_pipeline
+from bodhan.pipeline import PipelineError, run_pipeline
 from bodhan.pipeline.stages import narrate
 from tests.conftest import make_context, make_pdf
 
@@ -32,6 +34,13 @@ async def test_full_pipeline_produces_exports(tmp_path: Path) -> None:
     assert (export_dir / "lesson.html").is_file()
     assert (export_dir / "manifest.json").is_file()
     assert (export_dir / "quality_report.json").is_file()
+
+    # The exported manifest must include the export stage's own completion and
+    # match the finalized work manifest (not a pre-completion snapshot).
+    exported_manifest = json.loads((export_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert exported_manifest == manifest
+    assert exported_manifest["stages"]["export"]["status"] == "done"
+    assert exported_manifest["status"] == "done"
 
     audio = sorted((export_dir / "audio").glob("*.mp3"))
     assert len(audio) >= 4  # objectives, body, summary, vocabulary, exercises
@@ -66,6 +75,19 @@ async def test_completed_stages_are_skipped_on_rerun(tmp_path: Path) -> None:
 
     assert all(entry["status"] == "done" for entry in manifest["stages"].values())
     assert isinstance(ctx.llm, object)
+    exported = ctx.settings.exports_dir / "chapter-01" / "manifest.json"
+    assert json.loads(exported.read_text(encoding="utf-8")) == manifest
+
+
+async def test_export_failure_does_not_publish_a_completed_manifest(tmp_path: Path) -> None:
+    ctx = make_context(tmp_path)
+
+    with pytest.raises(PipelineError, match="run stage 'narrate' first"):
+        await run_pipeline(ctx, only=StageName.EXPORT)
+
+    entry = ctx.store.read_manifest()["stages"]["export"]
+    assert entry["status"] == "failed"
+    assert not (ctx.settings.exports_dir / "chapter-01" / "manifest.json").exists()
 
 
 def test_split_sections_and_narration_text() -> None:

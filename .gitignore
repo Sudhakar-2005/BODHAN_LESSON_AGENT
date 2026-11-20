@@ -32,3 +32,7 @@ data/exports/*
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Generated analysis graph and assignment output copies (regenerable)
+graphify-out/
+out/

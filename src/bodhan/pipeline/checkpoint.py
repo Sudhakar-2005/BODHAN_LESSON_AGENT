@@ -15,6 +15,13 @@ from typing import Any
 
 from bodhan.domain.models import StageName
 
+#: (stage, artifact) pairs where an empty JSON object is a legitimate "none
+#: found" result, not a corrupt checkpoint. Keep this list minimal: every
+#: other empty object remains invalid.
+_EMPTY_OBJECT_OK: frozenset[tuple[StageName, str]] = frozenset(
+    {(StageName.STRUCTURE, "tables.json")}
+)
+
 #: Files whose absence makes a completed stage unusable.
 _REQUIRED: dict[StageName, tuple[str, ...]] = {
     StageName.INGEST: ("pages.json",),
@@ -87,7 +94,7 @@ def _check_artifacts(root: Path, stage: StageName, *, legacy_ok: bool) -> tuple[
         if isinstance(payload, list) and not payload and name != "failed_segments.json":
             # Empty lists are legitimate for e.g. suppressed.json/figures.json.
             continue
-        if isinstance(payload, dict) and not payload:
+        if isinstance(payload, dict) and not payload and (stage, name) not in _EMPTY_OBJECT_OK:
             reasons.append(f"empty JSON object: {name}")
     return (not reasons), reasons
 

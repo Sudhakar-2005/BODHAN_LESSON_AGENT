@@ -26,6 +26,7 @@ from bodhan.domain.models import AudioSegment, Lesson, StageName
 from bodhan.pipeline.errors import PipelineError
 from bodhan.pipeline.stages.base import StageContext
 from bodhan.pipeline.state import load_input_pages, load_json, save_pages
+from bodhan.services.json_io import write_json_atomic
 
 NAME = StageName.EXPORT
 
@@ -151,10 +152,19 @@ async def run(ctx: StageContext) -> dict[str, Any]:
     if quality_path.is_file():
         shutil.copy2(quality_path, export_dir / "quality_report.json")
 
-    shutil.copy2(ctx.store.manifest_path, export_dir / "manifest.json")
-
     return {
         "export_dir": str(export_dir),
         "audio_files": copied,
         "flagged_blocks": len(lesson.flagged_block_ids),
     }
+
+
+def write_export_manifest(ctx: StageContext, manifest: dict[str, Any]) -> None:
+    """Publish the finalized manifest after the orchestrator records export.
+
+    Copying inside ``run()`` captured a snapshot that predated the export
+    stage's own entry; writing here keeps the exported manifest consistent with
+    the work manifest without hardcoding any stage status.
+    """
+    path = ctx.settings.exports_dir / ctx.chapter.chapter_id / "manifest.json"
+    write_json_atomic(path, manifest)

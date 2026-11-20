@@ -112,3 +112,83 @@ def test_all_checkpoint_states_are_distinguished(tmp_path: Path) -> None:
 
     (ctx.store.stage_dir(StageName.EXTRACT.value) / "pages.json").unlink()
     assert checkpoint_verification_level(ctx.store.root(), StageName.EXTRACT, hashes) == "invalid"
+
+
+def _seed_structure(ctx, *, tables=None, blocks=None):
+    """Write a complete structure checkpoint with controllable table/blocks data."""
+    directory = ctx.store.stage_dir(StageName.STRUCTURE.value)
+    write_json(directory / "pages.json", [])
+    write_json(directory / "blocks.json", [] if blocks is None else blocks)
+    write_json(directory / "suppressed.json", [])
+    write_json(directory / "continuity.json", [])
+    write_json(directory / "figures.json", [])
+    write_json(directory / "document_intelligence.json", {"tables": 0})
+    if tables is not None:
+        write_json(directory / "tables.json", tables)
+
+
+def test_empty_structure_tables_artifact_is_valid(tmp_path: Path) -> None:
+    """No tables found is a legitimate result, not a corrupt checkpoint."""
+    ctx = make_context(tmp_path)
+    _seed_structure(ctx, tables={})
+
+    valid, reasons = verify_stage_artifacts(ctx.store.root(), StageName.STRUCTURE)
+
+    assert valid, reasons
+    assert reasons == []
+
+
+def test_non_empty_structure_tables_artifact_is_valid(tmp_path: Path) -> None:
+    ctx = make_context(tmp_path)
+    _seed_structure(ctx, tables={"p0-b1": {"rows": 1, "columns": 1}})
+
+    valid, reasons = verify_stage_artifacts(ctx.store.root(), StageName.STRUCTURE)
+
+    assert valid, reasons
+
+
+def test_malformed_structure_tables_is_rejected(tmp_path: Path) -> None:
+    ctx = make_context(tmp_path)
+    _seed_structure(ctx, tables={})
+    (ctx.store.stage_dir(StageName.STRUCTURE.value) / "tables.json").write_text(
+        "{broken", encoding="utf-8"
+    )
+
+    valid, reasons = verify_stage_artifacts(ctx.store.root(), StageName.STRUCTURE)
+
+    assert not valid
+    assert any("malformed JSON" in reason for reason in reasons)
+
+
+def test_missing_structure_tables_is_rejected(tmp_path: Path) -> None:
+    ctx = make_context(tmp_path)
+    _seed_structure(ctx)
+
+    valid, reasons = verify_stage_artifacts(ctx.store.root(), StageName.STRUCTURE)
+
+    assert not valid
+    assert any("tables.json" in reason for reason in reasons)
+
+
+def test_other_empty_structure_objects_are_still_rejected(tmp_path: Path) -> None:
+    """The exception is limited to tables.json, not all structure artifacts."""
+    ctx = make_context(tmp_path)
+    _seed_structure(ctx, tables={}, blocks={})
+
+    valid, reasons = verify_stage_artifacts(ctx.store.root(), StageName.STRUCTURE)
+
+    assert not valid
+    assert any("empty JSON object: blocks.json" in reason for reason in reasons)
+
+
+def test_empty_structure_tables_keeps_hash_integrity(tmp_path: Path) -> None:
+    ctx = make_context(tmp_path)
+    _seed_structure(ctx, tables={})
+    hashes = stage_artifact_hashes(ctx.store.root(), StageName.STRUCTURE)
+    assert (
+        checkpoint_verification_level(ctx.store.root(), StageName.STRUCTURE, hashes) == "verified"
+    )
+
+    write_json(ctx.store.stage_dir(StageName.STRUCTURE.value) / "tables.json", {"changed": True})
+
+    assert checkpoint_verification_level(ctx.store.root(), StageName.STRUCTURE, hashes) == "invalid"

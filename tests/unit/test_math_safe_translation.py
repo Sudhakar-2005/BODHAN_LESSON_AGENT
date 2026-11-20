@@ -349,3 +349,224 @@ def test_preserve_math_only_and_segment_contract() -> None:
     segments, _ = segment_mixed_text("a $x$ b")
     assert "".join(segment.text for segment in segments) == "a $x$ b"
     assert all(isinstance(segment, TextSegment) for segment in segments)
+
+
+def _neutral_rebuild(segments: list[TextSegment]) -> str:
+    """Reassemble with neutral prose so only math-span handling is under test."""
+    chunks = [
+        f"word{index} "
+        for index, segment in enumerate(segments)
+        if segment.kind == "prose" and segment.text.strip()
+    ]
+    return reassemble(segments, chunks)
+
+
+def test_single_math_span_is_validated_once() -> None:
+    segments, _ = segment_mixed_text("Value $x$ here")
+    rebuilt = _neutral_rebuild(segments)
+
+    error, count = validate_math_spans(segments, rebuilt)
+
+    assert error is None
+    assert count == 1
+
+
+def test_same_math_span_twice_is_accepted() -> None:
+    segments, _ = segment_mixed_text("Lines $l$ and $m$; are $l$ and $m$ equal?")
+
+    error, count = validate_math_spans(segments, _neutral_rebuild(segments))
+
+    assert error is None
+    assert count == 4  # two '$l$' plus two '$m$'
+
+
+def test_multiple_distinct_spans_each_repeated_are_accepted() -> None:
+    segments, _ = segment_mixed_text("$a$ then $b$ then $a$ then $b$")
+
+    error, count = validate_math_spans(segments, _neutral_rebuild(segments))
+
+    assert error is None
+    assert count == 4
+
+
+@pytest.mark.parametrize(
+    ("text", "span"),
+    [
+        ("Two lines $l$ and $m$; are $l$ and $m$ perpendicular?", "$l$"),
+        ("$x = y$ and $a = b$; hence $x = y$ again", "$x = y$"),
+        ("BA $\\parallel$ ED and BC $\\parallel$ EF", "$\\parallel$"),
+        ("bisectors of $\\angle$ EAB and $\\angle$ RBA", "$\\angle$"),
+    ],
+)
+def test_tamil_repeated_math_examples_are_accepted(text: str, span: str) -> None:
+    """Spans that failed the Tamil live run are legitimate repeated source math."""
+    segments, _ = segment_mixed_text(text)
+    rebuilt = _neutral_rebuild(segments)
+
+    assert rebuilt.count(span) == 2
+    error, count = validate_math_spans(segments, rebuilt)
+
+    assert error is None
+    assert count >= 2
+
+
+def test_missing_one_occurrence_of_repeated_span_is_rejected() -> None:
+    segments, _ = segment_mixed_text("$l$ and $l$ again")
+    rebuilt = _neutral_rebuild(segments).replace("$l$", "L", 1)
+
+    error, _count = validate_math_spans(segments, rebuilt)
+
+    assert error is not None
+    assert "missing or altered" in error
+
+
+def test_extra_occurrence_introduced_during_reconstruction_is_rejected() -> None:
+    segments, _ = segment_mixed_text("$x$ here")
+    rebuilt = _neutral_rebuild(segments) + " plus an extra $x$"
+
+    error, _count = validate_math_spans(segments, rebuilt)
+
+    assert error is not None
+    assert "extra math span" in error
+
+
+def test_reordered_math_spans_are_rejected() -> None:
+    segments = [
+        TextSegment(kind="math", text="$a$"),
+        TextSegment(kind="prose", text=" and "),
+        TextSegment(kind="math", text="$b$"),
+    ]
+
+    error, _count = validate_math_spans(segments, "$b$ and $a$")
+
+    assert error is not None
+    assert "reordered" in error
+
+
+def test_modified_math_expression_is_rejected() -> None:
+    segments, _ = segment_mixed_text("$x = y$ and $z$")
+    rebuilt = _neutral_rebuild(segments).replace("$x = y$", "$x = z$")
+
+    error, _count = validate_math_spans(segments, rebuilt)
+
+    assert error is not None
+    assert "missing or altered" in error or "extra math span" in error
+
+
+def test_inline_and_display_math_are_accepted() -> None:
+    segments, _ = segment_mixed_text("Inline $a^2$ and display $$x + y$$ end")
+
+    error, count = validate_math_spans(segments, _neutral_rebuild(segments))
+
+    assert error is None
+    assert count == 2
+
+
+def test_math_only_block_is_accepted() -> None:
+    text = "$x^2 + y^2 = z^2$"
+    segments, _ = segment_mixed_text(text)
+
+    error, count = validate_math_spans(segments, text)
+
+    assert error is None
+    assert count == 1
+
+
+def test_span_split_keeps_repeated_math_out_of_provider_text() -> None:
+    text = "Lines $l$ and $m$; are $l$ and $m$ equal?"
+    segments, _ = segment_mixed_text(text)
+
+    assert all("$" not in chunk for chunk in prose_to_translate(segments))
+    error, count = validate_math_spans(segments, _neutral_rebuild(segments))
+    assert error is None
+    assert count == 4
+
+
+def test_bengali_textbf_failure_example_is_preserved() -> None:
+    """The Phase 6M Bengali block p2-b8 must reconstruct without a false failure."""
+    text = (
+        "\\textbf{Solution :} AOC is not a line, because "
+        "$\\angle AOB + \\angle COB = 100^\\circ + 82^\\circ = 182^\\circ$, "
+        "which is not equal to $180^\\circ$."
+    )
+    segments, ambiguous = segment_mixed_text(text)
+    provider_text = prose_to_translate(segments)
+
+    assert ambiguous is False
+    assert not any("{" in chunk or "}" in chunk for chunk in provider_text)
+    assert not any("\\textbf" in chunk for chunk in provider_text)
+    rebuilt = _neutral_rebuild(segments)
+    assert rebuilt.startswith("\\textbf{")
+    assert "$180^\\circ$" in rebuilt
+    error, count = validate_math_spans(segments, rebuilt)
+    assert error is None
+    assert count == 4  # '\textbf{', '}', two inline math spans
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["\\textit{Important}", "\\text{some text}", "\\mathrm{note}", "\\mbox{label}"],
+)
+def test_other_text_commands_keep_arguments_translatable(command: str) -> None:
+    text = f"Before {command} after $x$ end"
+    segments, _ = segment_mixed_text(text)
+    provider_text = prose_to_translate(segments)
+
+    assert command.split("{")[0] + "{" not in "".join(provider_text)
+    assert any(
+        part.strip("{} ") in " ".join(provider_text)
+        for part in [command[command.find("{") + 1 : -1]]
+    )
+    rebuilt = _neutral_rebuild(segments)
+    assert command.split("{")[0] + "{" in rebuilt
+    assert "}" in rebuilt
+    error, count = validate_math_spans(segments, rebuilt)
+    assert error is None
+    assert count >= 3
+
+
+def test_multiple_text_commands_in_one_block() -> None:
+    text = "\\textbf{First} then \\textit{Second} and $a$ end"
+    segments, _ = segment_mixed_text(text)
+    provider_text = prose_to_translate(segments)
+
+    assert not any("{" in chunk or "}" in chunk for chunk in provider_text)
+    rebuilt = _neutral_rebuild(segments)
+    assert rebuilt.count("\\textbf{") == 1
+    assert rebuilt.count("\\textit{") == 1
+    error, count = validate_math_spans(segments, rebuilt)
+    assert error is None
+    assert count == 5
+
+
+def test_text_command_adjacent_to_math_expression() -> None:
+    text = "\\textbf{Solution :}$x = y$ next"
+    segments, _ = segment_mixed_text(text)
+    rebuilt = _neutral_rebuild(segments)
+
+    assert "\\textbf{" in rebuilt and "$x = y$" in rebuilt
+    error, count = validate_math_spans(segments, rebuilt)
+    assert error is None
+    assert count == 3
+
+
+def test_repeated_math_spans_alongside_text_commands() -> None:
+    text = "\\textbf{Given} $l$ and $m$; are $l$ and $m$ parallel?"
+    segments, _ = segment_mixed_text(text)
+    rebuilt = _neutral_rebuild(segments)
+
+    assert rebuilt.count("$l$") == 2
+    error, count = validate_math_spans(segments, rebuilt)
+    assert error is None
+    assert count == 6  # '\textbf{', '}', '$l$', '$m$', '$l$', '$m$'
+
+
+def test_corrupted_math_near_text_command_still_fails() -> None:
+    text = "\\textbf{Solution :} $x = y$ end"
+    segments, _ = segment_mixed_text(text)
+    rebuilt = _neutral_rebuild(segments).replace("$x = y$", "$x = z$")
+
+    error, _count = validate_math_spans(segments, rebuilt)
+
+    assert error is not None
+    assert "missing or altered" in error or "extra math span" in error

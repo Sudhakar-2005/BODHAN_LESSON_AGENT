@@ -205,6 +205,8 @@ async def run_pipeline(
             artifact_hashes=stage_artifact_hashes(ctx.store.root(), name),
         )
         ctx.store.write_manifest(manifest)
+        if name is StageName.EXPORT:
+            export.write_export_manifest(ctx, manifest)
         emit_event(
             ctx.logger,
             "stage_completed",
@@ -233,4 +235,7 @@ async def run_pipeline(
 
     manifest["status"] = "done" if not only else manifest.get("status", "partial")
     ctx.store.write_manifest(manifest)
+    exported = manifest.get("stages", {}).get(StageName.EXPORT.value)
+    if isinstance(exported, dict) and exported.get("status") == "done":
+        export.write_export_manifest(ctx, manifest)
     return manifest

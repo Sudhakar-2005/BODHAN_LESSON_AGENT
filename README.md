@@ -85,6 +85,31 @@ uv run python -m bodhan_lesson --input data/inbox/chapter-01.pdf ^
 # --code-mixed are optional too.
 ```
 
+`--input` accepts a PDF, a single page image, or a folder of page images. The
+assignment CLI enforces the 5–30 page range; the internal override
+`BODHAN_ALLOW_SHORT_DOCUMENT=1` is only for synthetic fixtures.
+
+`--source-lang` is **metadata only**: Bodhan Indic-OCR and Indic-Translate do
+not take a source-language request field. Set it to the real source language
+(for example `hi` for a Hindi-medium PDF); it never rewrites source text.
+
+## Verified evidence (NCERT Chapter 6)
+
+The official 9-page English NCERT Class 9 Maths Chapter 6 PDF has been run
+end-to-end for three target languages. Each run completed all ten stages and
+produced `lesson.md`, `lesson.html`, section audio, `quality_report.json` and
+`manifest.json` under `out/<lang>/` and `data/exports/<chapter>-<lang>/`.
+
+| Language | Sections narrated / transcribed | Macro CER | Micro CER |
+|---|---:|---:|---:|
+| Hindi (`hi`) | 9 / 9 | 34.7211% | 50.8712% |
+| Tamil (`ta`) | 9 / 9 | 34.1256% | 47.5175% |
+| Bengali (`bn`) | 8 / 8 | 40.4301% | 52.7450% |
+
+Bengali has eight narratable sections because the composed lesson has eight
+bodied sections; this is not missing audio. Full details are in
+`docs/SUBMISSION.md`.
+
 ## Layout
 
 ```
@@ -114,10 +139,19 @@ docs/                # ARCHITECTURE.md, WORKFLOW.md, SUBMISSION.md, VIDEO_SCRIPT
 - **Failure handling:** terminal errors are not retried; 429+`Retry-After` is
   honoured with bounded backoff; failed blocks/segments are recorded, never
   silently dropped.
-- **Testing:** `uv run pytest` (offline, no credentials needed).
-  `uv run ruff check . && uv run ruff format --check . && uv run mypy`.
+- **Testing:** `uv run pytest` (offline, no credentials needed); use
+  `uv run pytest -p no:cacheprovider -q` for read-only verification. On Windows
+  machines with a nearly full C: drive, set `TEMP`, `TMP` and `UV_CACHE_DIR` to
+  a directory on D: before running uv commands.
+  `uv run ruff check . && uv run ruff format --check . && uv run mypy`
+  are the static checks.
 - **Known limitations:** document understanding is heuristic (tables/figures/
-  cross-page continuity); CER is surface-level; WAV has no embedded chapters
-  (sidecar timeline only); Tamil/Bengali live validation is not yet evidenced;
-  see `docs/SUBMISSION.md` for the honest live-vs-offline matrix.
+  cross-page continuity); CER is inflated by LaTeX/markup and digits that are
+  not necessarily spoken verbatim; WAV has no embedded chapters (sidecar
+  timeline only); headerless STT 429s required controlled resumes because
+  stage-level pacing is not implemented; some provider metrics (request IDs,
+  usage, monetary cost) are not exposed by the APIs; the second-source Hindi
+  Chapter 5 PDF is blocked by a provider-side OCR 502 on page 6; no demo video
+  has been recorded yet. See `docs/SUBMISSION.md` for the current evidence
+  status and remaining submission blockers.
 ```

@@ -46,7 +46,9 @@ source block IDs and reasons; OCR artifacts are never mutated.
 ## Robustness (Phase 3B-2)
 
 - Per-block/per-section checkpoints with source hashes; resume reuses only
-  valid outcomes; math placeholders are validated before restoration.
+  valid outcomes. Math spans are withheld from the provider and verified
+  byte-for-byte after reconstruction (multiset count plus order); LaTeX
+  text-command delimiters such as `\textbf{` and `}` are preserved locally.
 - Stage checkpoints validate artifact existence, JSON parseability and hashes
   (`checkpoint_verification_level`: `verified` / `legacy` / `invalid`).
 - Input validation fails with actionable errors before any provider call.
@@ -64,3 +66,21 @@ source block IDs and reasons; OCR artifacts are never mutated.
   sidecar `timeline.json`; WAV has **no embedded chapters** (not claimed).
 - Final report (`bodhan/reporting/report.py`): aggregates persisted evidence;
   unavailable values are null with explicit `null_value_reasons`.
+
+## Source-language handling and environment notes
+
+- `--source-lang` on the assignment CLI is pipeline metadata only. Bodhan
+  Indic-OCR and Indic-Translate do not take a source-language request field;
+  the source language is recorded for provenance and never causes source text
+  to be rewritten. Target languages are validated against the documented
+  provider enums before any API call.
+- On Windows machines where the C: drive is nearly full, set `TEMP`, `TMP` and
+  `UV_CACHE_DIR` to a directory on another drive (for example `D:\`) before
+  running `uv` commands. This is an environment workaround only — dependency
+  versions and `uv.lock` are unchanged.
+- For read-only verification, `uv run pytest -p no:cacheprovider -q` avoids
+  creating pytest cache files. Static checks are
+  `uv run ruff check . && uv run ruff format --check . && uv run mypy src`.
+- The optional second-source Hindi PDF remains blocked by a provider-side OCR
+  502 on page 6; see `docs/SUBMISSION.md` for the exact disclosure. No
+  alternative provider or fallback is used.
