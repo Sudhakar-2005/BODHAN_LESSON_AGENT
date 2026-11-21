@@ -23,11 +23,12 @@ Verified official contract (``https://console.bodhan.ai/api-docs``, inspected
               exceed the ceiling, so WAV payloads are split into <= 30 s
               pieces client-side, each piece is transcribed, and the piece
               texts are joined verbatim with a space.
-- errors    : ``401`` auth, ``400``/``413`` validation, ``415`` unsupported
-              or undecodable container, ``429`` out-of-credit (terminal, no
-              header) vs rate-limit ``429`` + ``retry-after`` (documented
-              8 RPM sliding window - retried), ``5xx`` transient (bounded
-              exponential backoff). Auth/validation failures stay terminal.
+- errors    : ``401``/``403`` auth and ``400``/``413``/``415``/``422``
+              validation are terminal; ``5xx``/transport are transient;
+              ``429`` is retried with bounded exponential backoff (honouring
+              ``retry-after`` when present). An explicit budget/quota 429 is
+              terminal - flagged by its error code/message, NOT by the mere
+              absence of ``retry-after`` (real rate limits omit it too).
 - headers   : ``x-request-id`` captured when present; published limits read
               from ``x-ratelimit-limit-*`` (response-driven, never hardcoded).
 - billing   : ₹0.10 per audio minute; the API does not echo usage, so
@@ -40,6 +41,7 @@ in this package, and this adapter never silently switches providers.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import mimetypes
 import time
@@ -70,11 +72,45 @@ from bodhan.ports.transcribe import (
     TranscriptionResult,
 )
 
-#: Retryable statuses: transient transport/5xx plus the rate-limit 429 that
-#: carries ``retry-after`` (that distinction is made in ``_is_retryable``).
+#: Retryable statuses: transient transport/5xx plus every 429 not explicitly
+#: flagged as a budget/quota failure (see ``_is_budget_429``).
 _RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
 #: Documented per-request ceiling (the gateway rejects anything longer).
 MAX_AUDIO_SECONDS = 30.0
+
+#: Conservative markers of a *terminal* budget/quota 429. The observed
+#: rate-limit body ("Maximum rate limit reached for the model") contains none
+#: of these, so it is retried. We never infer "out of credit" from a missing
+#: ``retry-after`` header: real rate limits omit that header too.
+_BUDGET_MARKERS = (
+    "out of credit",
+    "insufficient credit",
+    "insufficient balance",
+    "out of budget",
+    "budget exceeded",
+    "exceeded budget",
+)
+_BUDGET_CODES = frozenset(
+    {
+        "out_of_credit",
+        "insufficient_credit",
+        "insufficient_balance",
+        "out_of_budget",
+        "budget_exceeded",
+        "exceeded_budget",
+        "quota_exceeded",
+    }
+)
+
+
+def _is_budget_429(exc: TranscriptionProviderError) -> bool:
+    """True only for an explicit budget/quota 429 (never for a bare rate limit)."""
+    if exc.status_code != 429:
+        return False
+    if exc.code is not None and exc.code.strip().lower() in _BUDGET_CODES:
+        return True
+    message = str(exc).lower()
+    return any(marker in message for marker in _BUDGET_MARKERS)
 
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -83,10 +119,11 @@ def _is_retryable(exc: BaseException) -> bool:
     if not isinstance(exc, TranscriptionProviderError):
         return False
     if exc.status_code == 429:
-        # Documented: the rate-limit 429 carries `retry-after` (8 RPM
-        # sliding window); an out-of-credit 429 does not - that one is
-        # terminal and must not be retried.
-        return exc.retry_after is not None
+        # Retry every rate-limit 429 with bounded backoff. ``RetryAfterWait``
+        # already honours ``retry-after`` when present and otherwise falls back
+        # to exponential backoff - so no header is no reason to give up. Only an
+        # explicit budget/quota failure is terminal.
+        return not _is_budget_429(exc)
     return exc.status_code in _RETRYABLE_STATUS
 
 
@@ -158,6 +195,7 @@ class BodhanTranscribeAdapter(TranscribePort):
         timeout_s: float = 60.0,
         max_retries: int = 3,
         max_audio_seconds: float = MAX_AUDIO_SECONDS,
+        pace_s: float = 0.0,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         if not base_url:
@@ -169,10 +207,16 @@ class BodhanTranscribeAdapter(TranscribePort):
                 f"max_audio_seconds must be within the documented "
                 f"{MAX_AUDIO_SECONDS:g} s request limit"
             )
+        if pace_s < 0:
+            raise ValueError("pace_s must be non-negative")
         self._base_url = base_url
         self._model = model
         self._max_audio_seconds = max_audio_seconds
         self._max_retries = max(1, max_retries)
+        #: Configurable delay before every request. Requests are already
+        #: sequential; pacing spreads them out so a burst cannot hit the RPM
+        #: window. The provider's window size is never invented here.
+        self._pace_s = pace_s
         self._rate_limit: RateLimitInfo | None = None
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(timeout=httpx.Timeout(timeout_s))
@@ -257,6 +301,8 @@ class BodhanTranscribeAdapter(TranscribePort):
         content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
         files = {"file": (filename, data, content_type)}
 
+        if self._pace_s > 0:
+            await asyncio.sleep(self._pace_s)
         started = time.perf_counter()
         try:
             async for attempt in AsyncRetrying(

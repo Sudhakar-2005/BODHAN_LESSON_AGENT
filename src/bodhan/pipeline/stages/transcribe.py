@@ -29,10 +29,16 @@ field from ``transcription_text`` here.
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
+import tempfile
+import wave
 from pathlib import Path
 from typing import Any
 
+from bodhan.adapters.transcribe.errors import TranscriptionProviderError
+from bodhan.adapters.transcribe.indic_transcribe import split_wav
 from bodhan.domain.models import AudioSegment, StageName
 from bodhan.observability import emit_event
 from bodhan.pipeline.errors import PipelineError
@@ -148,6 +154,132 @@ def _failed_record(
     return record
 
 
+# -- per-chunk checkpoints ---------------------------------------------------
+# A segment is split into <=30 s pieces by the same helper the adapter uses.
+# Each successful piece is persisted on its own so a 429 on a later piece can
+# never discard earlier work, and a resume reuses every completed piece.
+
+
+def _wav_meta(data: bytes) -> dict[str, int] | None:
+    """Rate/channels/width/frames for a WAV piece, or None if not measurable."""
+    try:
+        with wave.open(io.BytesIO(data), "rb") as handle:
+            return {
+                "sample_rate": handle.getframerate(),
+                "channels": handle.getnchannels(),
+                "sample_width": handle.getsampwidth(),
+                "frames": handle.getnframes(),
+            }
+    except (wave.Error, EOFError):
+        return None
+
+
+def _chunk_identity(
+    path: Path,
+    metas: list[dict[str, int] | None],
+    pieces: list[bytes],
+    index: int,
+    language: str,
+) -> dict[str, Any]:
+    """Full identity of one chunk: audio, index, boundaries and language."""
+    stat = path.stat()
+    meta = metas[index - 1]
+    identity: dict[str, Any] = {
+        "audio_file": path.name,
+        "audio_size_bytes": stat.st_size,
+        "audio_mtime_ns": stat.st_mtime_ns,
+        "chunk_index": index,
+        "chunk_count": len(pieces),
+        "chunk_sha256": hashlib.sha256(pieces[index - 1]).hexdigest(),
+        "target_language": language,
+    }
+    if meta is not None:
+        identity.update(
+            {
+                "sample_rate": meta["sample_rate"],
+                "channels": meta["channels"],
+                "sample_width": meta["sample_width"],
+                "start_frame": sum(m["frames"] for m in metas[: index - 1] if m),
+                "end_frame": sum(m["frames"] for m in metas[:index] if m),
+            }
+        )
+    return identity
+
+
+def _chunk_path(ctx: StageContext, section_id: str, index: int) -> Path:
+    return ctx.store.stage_dir(NAME.value) / "chunks" / section_id / f"chunk-{index:02d}.json"
+
+
+def _load_chunk(ctx: StageContext, section_id: str, index: int) -> dict[str, Any] | None:
+    path = _chunk_path(ctx, section_id, index)
+    if not path.is_file():
+        return None
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _chunk_reusable(record: dict[str, Any] | None, identity: dict[str, Any]) -> bool:
+    """A chunk is reusable only on status ok AND an exact identity match."""
+    return (
+        record is not None
+        and record.get("status") == "ok"
+        and record.get("identity") == identity
+        and isinstance(record.get("text"), str)
+    )
+
+
+def _ok_record_from_chunks(
+    segment: AudioSegment,
+    path: Path,
+    *,
+    language: str,
+    chunks: list[dict[str, Any]],
+    text: str,
+    reused: int,
+) -> dict[str, Any]:
+    """Rebuild the documented segment record from verbatim chunk results."""
+    stat = path.stat()
+    usage: dict[str, int | float] = {}
+    raw: list[dict[str, Any]] = []
+    request_ids: list[str] = []
+    providers: set[str] = set()
+    models: set[str] = set()
+    latency = 0
+    for chunk in chunks:
+        latency += int(chunk.get("latency_ms", 0) or 0)
+        for key, value in (chunk.get("usage") or {}).items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                usage[key] = usage.get(key, 0) + value
+        raw.extend(chunk.get("raw") or [])
+        if chunk.get("request_id"):
+            request_ids.append(str(chunk["request_id"]))
+        if chunk.get("provider"):
+            providers.add(str(chunk["provider"]))
+        if chunk.get("model"):
+            models.add(str(chunk["model"]))
+    return {
+        "section_id": segment.segment_id,
+        "audio_file": path.name,
+        "audio_size_bytes": stat.st_size,
+        "audio_mtime_ns": stat.st_mtime_ns,
+        "target_language": language,
+        "provider": next(iter(providers)) if len(providers) == 1 else ",".join(sorted(providers)),
+        "model": next(iter(models)) if len(models) == 1 else ",".join(sorted(models)),
+        # Exact chunk order, joined verbatim - never rewritten or omitted.
+        "transcription_text": text,
+        "latency_ms": latency,
+        "usage": usage,
+        "request_id": ",".join(request_ids) if request_ids else None,
+        "status": "ok",
+        "raw": raw,
+        "chunk_count": len(chunks),
+        "chunks_reused": reused,
+    }
+
+
 async def run(ctx: StageContext) -> dict[str, Any]:
     """Back-transcribe every narrated segment, checkpointing each result."""
     pages = load_input_pages(ctx.store, NAME)
@@ -172,6 +304,7 @@ async def run(ctx: StageContext) -> dict[str, Any]:
     ok: dict[str, dict[str, Any]] = {}
     failed: list[dict[str, str]] = []
     reused = 0
+    chunks_reused = 0
 
     for index, segment in enumerate(segments, start=1):
         path = Path(segment.audio_path)
@@ -187,8 +320,108 @@ async def run(ctx: StageContext) -> dict[str, Any]:
                 # Fail this segment cleanly instead of asking a provider
                 # about audio that is not there.
                 raise FileNotFoundError(f"narrated audio is missing: {path}")
-            result = await ctx.transcribe.transcribe(path, language=language)
-            record = _ok_record(segment, path, language=language, result=result)
+            data = path.read_bytes()
+            pieces = split_wav(data, ctx.settings.transcribe_max_audio_s)
+            metas = [_wav_meta(piece) for piece in pieces]
+            texts: list[str] = []
+            chunk_records: list[dict[str, Any]] = []
+            failed_chunks: list[int] = []
+            reused_here = 0
+            # Only temporary COPIES of a piece are written; the source audio is
+            # never modified. They are deleted as soon as the segment ends.
+            with tempfile.TemporaryDirectory(prefix="bodhan-transcribe-") as tmp:
+                tmp_dir = Path(tmp)
+                for chunk_index, piece in enumerate(pieces, start=1):
+                    identity = _chunk_identity(path, metas, pieces, chunk_index, language)
+                    prior_chunk = _load_chunk(ctx, segment.segment_id, chunk_index)
+                    if _chunk_reusable(prior_chunk, identity):
+                        texts.append(prior_chunk["text"])  # type: ignore[index]
+                        chunk_records.append(prior_chunk)  # type: ignore[arg-type]
+                        reused_here += 1
+                        chunks_reused += 1
+                        ctx.logger.info(
+                            "reusing chunk %s/%s of %s",
+                            chunk_index,
+                            len(pieces),
+                            segment.segment_id,
+                        )
+                        continue
+
+                    if len(pieces) == 1:
+                        # Keep the original path for single-chunk segments:
+                        # provider-facing naming/metadata stay unchanged.
+                        piece_path = path
+                    else:
+                        piece_path = (
+                            tmp_dir / f"{path.stem}.part{chunk_index:02d}{path.suffix or '.wav'}"
+                        )
+                        piece_path.write_bytes(piece)
+                    try:
+                        result = await ctx.transcribe.transcribe(piece_path, language=language)
+                    except Exception as chunk_exc:  # persisted as a chunk failure
+                        chunk_message = f"{type(chunk_exc).__name__}: {chunk_exc}"
+                        chunk_record: dict[str, Any] = {
+                            "status": "failed",
+                            "identity": identity,
+                            "error": chunk_message,
+                        }
+                        save_json(
+                            ctx.store,
+                            NAME,
+                            f"chunks/{segment.segment_id}/chunk-{chunk_index:02d}.json",
+                            chunk_record,
+                        )
+                        chunk_records.append(chunk_record)
+                        failed_chunks.append(chunk_index)
+                        ctx.logger.warning(
+                            "transcription failed for %s chunk %s: %s",
+                            segment.segment_id,
+                            chunk_index,
+                            chunk_message,
+                        )
+                        continue
+
+                    ok_chunk: dict[str, Any] = {
+                        "status": "ok",
+                        "identity": identity,
+                        "text": result.text,
+                        "latency_ms": result.latency_ms,
+                        "usage": dict(result.usage),
+                        "request_id": result.request_id,
+                        "provider": result.provider,
+                        "model": result.model,
+                        "raw": result.raw,
+                    }
+                    # Atomic per-chunk checkpoint: survives any later failure.
+                    save_json(
+                        ctx.store,
+                        NAME,
+                        f"chunks/{segment.segment_id}/chunk-{chunk_index:02d}.json",
+                        ok_chunk,
+                    )
+                    texts.append(result.text)
+                    chunk_records.append(ok_chunk)
+
+            if failed_chunks:
+                # A gap is never silently omitted - the whole segment fails and
+                # only the missing chunks are retried on the next run. Keep the
+                # underlying provider error in the segment message for evidence.
+                details = "; ".join(
+                    f"chunk {chunk['identity']['chunk_index']}: {chunk.get('error', '')}"
+                    for chunk in chunk_records
+                    if chunk.get("status") == "failed"
+                )
+                raise TranscriptionProviderError(
+                    f"chunk(s) failed for {segment.segment_id}: {failed_chunks} ({details})"
+                )
+            record = _ok_record_from_chunks(
+                segment,
+                path,
+                language=language,
+                chunks=chunk_records,
+                text=" ".join(texts),
+                reused=reused_here,
+            )
         except Exception as exc:  # record the failure, keep every earlier success
             message = f"{type(exc).__name__}: {exc}"
             record = _failed_record(
@@ -266,6 +499,7 @@ async def run(ctx: StageContext) -> dict[str, Any]:
             "model": ctx.settings.transcribe_model,
             "total_segments": len(segments),
             "resumed_cached": reused,
+            "chunks_reused": chunks_reused,
             "completed_segments": [
                 segment.segment_id for segment in segments if segment.segment_id in ok
             ],
@@ -290,6 +524,7 @@ async def run(ctx: StageContext) -> dict[str, Any]:
         "segments": len(segments),
         "transcribed": len(ok),
         "resumed_cached": reused,
+        "chunks_reused": chunks_reused,
         "target_language": language,
         "provider": ctx.transcribe.provider,
         "model": ctx.settings.transcribe_model,

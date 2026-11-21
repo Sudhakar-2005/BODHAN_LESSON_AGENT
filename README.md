@@ -36,9 +36,10 @@ ingest → preprocess → extract(Indic-OCR) → structure(LLM) → quality(LLM)
   narrated segment is transcribed back with `POST /v1/audio/transcriptions`
   (model `indic-transcribe`) and stored verbatim under `transcribe/` —
   never translated, never rewritten, and kept separate from the narration
-  script. Records are checkpointed per segment: a re-run never retranscribes
-  completed segments, and the stage cannot be marked done while any required
-  segment is missing.
+  script. Audio is split into ≤30 s chunks and each successful chunk is
+  checkpointed under `transcribe/chunks/`, so a re-run never retranscribes a
+  completed chunk; the stage cannot be marked done while any required chunk
+  is missing.
 
 ## Setup (Windows / Linux)
 
@@ -65,6 +66,8 @@ required only for a live pipeline run):
 | `BODHAN_TRANSLATE_KEY` | Indic-Translate credential |
 | `BODHAN_SPEAK_KEY` | Indic-Speak credential |
 | `BODHAN_TRANSCRIBE_KEY` | Indic-Transcribe credential |
+| `BODHAN_MAX_RETRIES` | per-request attempt limit for Bodhan adapters (default `3`) |
+| `TRANSCRIBE_PACING_S` | delay before each Indic-Transcribe request (default `0`; use `8` for long runs) |
 | `LLM_API_KEY` / `GEMINI_API_KEY` | Gemini planner/auditor credential |
 
 `.env` is gitignored; all credential fields are `repr=False`. Never commit a
@@ -93,7 +96,9 @@ assignment CLI enforces the 5–30 page range; the internal override
 not take a source-language request field. Set it to the real source language
 (for example `hi` for a Hindi-medium PDF); it never rewrites source text.
 
-## Verified evidence (NCERT Chapter 6)
+## Verified evidence
+
+### Completed demo — NCERT Class 9 Maths Chapter 6 (English source)
 
 The official 9-page English NCERT Class 9 Maths Chapter 6 PDF has been run
 end-to-end for three target languages. Each run completed all ten stages and
@@ -107,8 +112,20 @@ produced `lesson.md`, `lesson.html`, section audio, `quality_report.json` and
 | Bengali (`bn`) | 8 / 8 | 40.4301% | 52.7450% |
 
 Bengali has eight narratable sections because the composed lesson has eight
-bodied sections; this is not missing audio. Full details are in
-`docs/SUBMISSION.md`.
+bodied sections; this is not missing audio.
+
+### Completed second-source run — NCERT Class 9 Science Chapter 2 (Hindi source → Tamil)
+
+The official 20-page Hindi-medium NCERT Class 9 Science Chapter 2 PDF
+(`D:\phase6w-temp\ncert-class9-science-hi-ch2-ihsc102.pdf`) completed all ten
+stages: OCR 20/20 pages (239 blocks), structure 224 blocks, Tamil translation
+224/224 blocks, composition, 10 narration sections, 146/146 transcription
+chunks, CER, audio assembly and export. Macro CER **16.3023 %**, micro CER
+**15.2483 %**; full audio **4,287.744 s**. The successful paced transcription
+used `TRANSCRIBE_PACING_S=8` and `BODHAN_MAX_RETRIES=3` with **zero HTTP 429
+responses**. An earlier 14-page Hindi Chapter 5 candidate was blocked by a
+provider-side OCR 502 on page 6 and was not used as the second source. Full
+details are in `docs/SUBMISSION.md`.
 
 ## Layout
 
@@ -136,22 +153,27 @@ docs/                # ARCHITECTURE.md, WORKFLOW.md, SUBMISSION.md, VIDEO_SCRIPT
   / `invalid`) and per-block/per-segment checkpoints. See `docs/WORKFLOW.md`.
 - **Concurrency:** provider calls are intentionally serialized (no semaphore);
   `provider_max_concurrency` is documentation only, not an active controller.
-- **Failure handling:** terminal errors are not retried; 429+`Retry-After` is
-  honoured with bounded backoff; failed blocks/segments are recorded, never
-  silently dropped.
+- **Failure handling:** terminal auth/validation/budget errors are not retried;
+  HTTP 429 is retried with bounded exponential backoff, honouring
+  `Retry-After` when supplied; per-chunk checkpoints preserve all successful
+  work, and failed chunks are recorded, never silently dropped.
+  `TRANSCRIBE_PACING_S` adds a configurable delay before each request.
 - **Testing:** `uv run pytest` (offline, no credentials needed); use
-  `uv run pytest -p no:cacheprovider -q` for read-only verification. On Windows
-  machines with a nearly full C: drive, set `TEMP`, `TMP` and `UV_CACHE_DIR` to
-  a directory on D: before running uv commands.
-  `uv run ruff check . && uv run ruff format --check . && uv run mypy`
-  are the static checks.
+  `uv run pytest -p no:cacheprovider -q` for read-only verification. The latest
+  verified suite is **512 passed** (Phase 6AV; the earlier baseline was
+  **508 passed** before four assembler regression tests were added), with Ruff,
+  Ruff format, Mypy and the offline lock check green. On Windows machines with a nearly full C: drive,
+  set `TEMP`, `TMP` and `UV_CACHE_DIR` to a directory on D: before running uv
+  commands.
 - **Known limitations:** document understanding is heuristic (tables/figures/
   cross-page continuity); CER is inflated by LaTeX/markup and digits that are
   not necessarily spoken verbatim; WAV has no embedded chapters (sidecar
-  timeline only); headerless STT 429s required controlled resumes because
-  stage-level pacing is not implemented; some provider metrics (request IDs,
-  usage, monetary cost) are not exposed by the APIs; the second-source Hindi
-  Chapter 5 PDF is blocked by a provider-side OCR 502 on page 6; no demo video
-  has been recorded yet. See `docs/SUBMISSION.md` for the current evidence
-  status and remaining submission blockers.
+  timeline only); some provider metrics (request IDs, usage, monetary cost) are
+  not exposed — STT cost is an explicitly labelled estimate (₹0.10/audio-min),
+  not provider-reported; historical second-source translation checkpoints
+  retain zero span-count metadata (the fix applies only to newly generated
+  checkpoints); no demo video has been recorded yet. The audio assembler's
+  heading matcher now selects the longest matching heading when one heading is
+  a prefix of another, with equal-length ties rejected. See
+  `docs/SUBMISSION.md` for evidence and remaining tasks.
 ```

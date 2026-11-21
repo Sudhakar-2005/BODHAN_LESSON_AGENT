@@ -1,139 +1,169 @@
-# Submission status (evidence-based, current)
+# Submission status (evidence-based)
 
-This report replaces the earlier stale submission notes. It describes the
-repository as it stands **before** the outstanding uncommitted work is
-committed. No claim below should be read as a clean-clone verification of the
-current working tree.
+This report reflects the repository after Phase 6AV. No claim here should be
+read as a clean-clone verification of the current working tree.
 
 ## A. Repository state
 
 - Branch: `assignment/narrated-lesson-Sudhakar-2005`
-- HEAD: `f7d1e80792084be283f1ac4a21ac3cb3542b7987`
-- Working tree is **dirty**: **12 modified files total**, with **no staged
-  changes** and **no new commit containing these changes yet**. HEAD remains
-  `f7d1e80792084be283f1ac4a21ac3cb3542b7987`.
-- **Seven modified source/test files** (implementation and regression tests):
-  - `src/bodhan/document/equations.py` (Phase 6K repeated-span validation and
-    Phase 6N LaTeX text-command delimiter preservation)
-  - `src/bodhan/pipeline/checkpoint.py` (Phase 6G empty-table checkpoint fix)
-  - `src/bodhan/pipeline/orchestrator.py` (Phase 6I finalized export manifest)
-  - `src/bodhan/pipeline/stages/export.py` (Phase 6I export manifest helper)
-  - `tests/unit/test_checkpoint_integrity.py`
-  - `tests/unit/test_math_safe_translation.py`
-  - `tests/unit/test_pipeline_e2e.py`
-- **Five modified documentation/configuration files**:
-  - `.gitignore` (generated `out/` and `graphify-out/` are ignored)
-  - `README.md`
-  - `docs/ARCHITECTURE.md`
-  - `docs/SUBMISSION.md`
-  - `docs/VIDEO_SCRIPT.md`
-- `graphify-out/` (generated graph output) and `out/` (generated assignment
-  output copies) remain present locally and are intentionally ignored; no
-  generated artifact has been deleted or moved.
-- This report is being prepared **before** those changes are committed. A clean
-  clone of HEAD contains **none** of the twelve modifications — neither the
-  seven implementation/test fixes nor the five documentation/configuration
-  updates.
+- HEAD: `ec22973da45f2aed78891d691e79a6b0ce9ddeae`
+  (`fix: preserve math spans and align submission evidence`).
+- Working tree is **dirty** with **no staged changes**: 14 modified tracked
+  files and 3 untracked test files (17 total).
+- Uncommitted implementation/test changes:
+  - `src/bodhan/document/equations.py` (scientific-unit protection)
+  - `src/bodhan/pipeline/stages/compose.py` (bounded missing-block recovery,
+    deterministic placement, recovery provenance)
+  - `src/bodhan/pipeline/stages/translate.py` (unit-span counting and metadata)
+  - `src/bodhan/adapters/transcribe/indic_transcribe.py`, `src/bodhan/config.py`,
+    `src/bodhan/wiring.py`, `src/bodhan/pipeline/stages/transcribe.py`
+    (bounded headerless-429 backoff, `TRANSCRIBE_PACING_S`, per-chunk resume)
+  - `src/bodhan/assembly/audio.py` (longest-prefix heading disambiguation)
+  - `tests/unit/test_math_safe_translation.py`,
+    `tests/unit/test_compose_missing_block_recovery.py` (untracked),
+    `tests/unit/test_translation_checkpoint_metadata.py` (untracked),
+    `tests/unit/test_transcribe_resilience.py` (untracked),
+    `tests/unit/test_audio_assembly.py`
+- Documentation updated in Phase 6AV: `README.md`, `docs/SUBMISSION.md`,
+  `docs/ARCHITECTURE.md`, `docs/VIDEO_SCRIPT.md`.
+- `graphify-out/` and `out/` remain present locally and are intentionally
+  ignored; no generated artifact was deleted or moved.
+- No Git remote is configured. No PR or submission email has been created.
 
 ## B. Implemented pipeline
 
-The ordered, checkpointed pipeline is defined in
-`src/bodhan/pipeline/orchestrator.py`:
+The ordered pipeline in `src/bodhan/pipeline/orchestrator.py`:
 
-1. `ingest` — rasterise PDF pages (or read page images) to PNG; never read the
-   embedded PDF text layer; enforce the 5–30 page range in the assignment CLI.
-2. `preprocess` — deskew/contrast-clean the page images.
-3. `extract` — Bodhan Indic-OCR only; per-page blocks with IDs, bbox,
-   confidence and reading order.
-4. `structure` — deterministic label mapping; Gemini only for `UNKNOWN`
-   labels; document intelligence (suppression, continuity, tables, figures).
-5. `quality` — Gemini audit producing flags/reasons only, never rewritten text.
-6. `translate` — Bodhan Indic-Translate only; math spans and LaTeX text-command
-   delimiters are withheld from the provider and restored locally.
-7. `compose` — English-only Gemini plan; every scaffold string is translated
-   through Indic-Translate before entering the lesson.
-8. `narrate` — Bodhan Indic-Speak only; WAV segments, resume at first missing
-   segment, terminal budget errors are never retried.
-9. `transcribe` — Bodhan Indic-Transcribe only; ≤30 s WAV splits, verbatim
-   per-segment checkpoints.
+1. `ingest` — rasterise PDF pages / read page images; embedded PDF text is
+   never used; page range enforced by the assignment CLI.
+2. `preprocess` — deskew/contrast-clean images.
+3. `extract` — Bodhan Indic-OCR only; per-page block IDs, bbox, confidence,
+   reading order and provider metadata.
+4. `structure` — deterministic label mapping; Gemini only for `UNKNOWN` labels;
+   suppression, continuity, tables and figure associations.
+5. `quality` — Gemini flags/reasons only; never rewrites text.
+6. `translate` — Bodhan Indic-Translate only; math spans, LaTeX delimiters and
+   scientific units are protected, span counts persisted in checkpoints.
+7. `compose` — English-only Gemini plan; at most one bounded recovery request
+   for omitted IDs, inserted by authoritative source reading order; scaffold
+   strings translated by Indic-Translate with provenance.
+8. `narrate` — Bodhan Indic-Speak only (WAV); per-segment checkpoint/resume.
+9. `transcribe` — Bodhan Indic-Transcribe only; ≤30 s splits, verbatim text,
+   per-chunk checkpoints, configurable pacing and bounded 429 backoff.
 10. `export` — local copy of lesson Markdown/HTML, section audio, quality
-    report and the finalized manifest into `data/exports/<chapter>/`.
+    report and finalized manifest.
 
-The assignment CLI (`python -m bodhan_lesson`) runs one language at a time and
-copies the export into `out/<lang>/`. `--source-lang` is metadata only: the
-Bodhan OCR and Translate endpoints take no source-language field.
+`python -m bodhan_lesson` runs one target language at a time and copies the
+export into `out/<lang>/`. `--source-lang` is metadata only.
 
-## C. Verified language evidence
+## C. Completed demonstration — NCERT Class 9 Maths Chapter 6
 
 All three Chapter 6 runs used the same official 9-page English NCERT Class 9
-Maths Chapter 6 PDF (`data/demo/inputs/ncert-class9-maths-ch6-lines-and-angles-official.pdf`).
-Every run completed all ten stages and produced exported Markdown, HTML,
-section audio, quality reports and manifests.
+Maths Chapter 6 PDF. Every run completed all ten stages.
 
-| Language | Source | Sections narrated | Sections transcribed | CER macro | CER micro |
-|---|---|---:|---:|---:|---:|
-| Hindi | NCERT Class 9 Maths Chapter 6, English source | 9 | 9 | 34.7211% | 50.8712% |
-| Tamil | Same Chapter 6 source | 9 | 9 | 34.1256% | 47.5175% |
-| Bengali | Same Chapter 6 source | 8 | 8 | 40.4301% | 52.7450% |
+| Language | Source | Sections narrated/transcribed | Macro CER | Micro CER |
+|---|---|---:|---:|---:|
+| Hindi | NCERT Class 9 Maths Ch6, English source | 9 / 9 | 34.7211% | 50.8712% |
+| Tamil | Same source | 9 / 9 | 34.1256% | 47.5175% |
+| Bengali | Same source | 8 / 8 | 40.4301% | 52.7450% |
 
-Bengali has eight narratable sections because the composed Bengali lesson has
-eight bodied sections. This is the correct lesson structure, not missing audio.
+Bengali has eight narratable sections because the composed lesson has eight
+bodied sections; this is correct structure, not missing audio.
 
-For each language the following exist:
+For each language:
 - `data/work/ncert-class9-maths-ch6-lines-and-angles-official-<lang>/`
-  with all stage artifacts, `evaluation/cer/`, `audio/full_lesson.wav`,
+  contains all stage artifacts, `evaluation/cer/`, `audio/full_lesson.wav`,
   `audio/timeline.json`, `audio/assembly_manifest.json` and `report.json`;
-- `data/exports/ncert-class9-maths-ch6-lines-and-angles-official-<lang>/`;
-- `out/<lang>/lesson.md`, `lesson.html`, `audio/`, `quality_report.json` and
-  `manifest.json`.
+- `data/exports/ncert-class9-maths-ch6-lines-and-angles-official-<lang>/`
+  and `out/<lang>/` contain the exported lesson, HTML, audio, quality report
+  and manifest.
 
-The Hindi report records commit `ecc3b37e…` (it was generated before the Phase
-6F commit); the Tamil and Bengali reports record `f7d1e80…` and honestly mark
-`working_tree_clean=false`.
+## D. Completed second source — NCERT Class 9 Science Chapter 2
 
-## D. Second-source attempt (not complete)
+Selected second source: official NCERT Class 9 Science Chapter 2, Hindi medium,
+20 pages, at `D:\phase6w-temp\ncert-class9-science-hi-ch2-ihsc102.pdf`.
+Target language: Tamil. Chapter ID: `ncert-class9-science-ch2-cell-hindi`.
 
-- Candidate: official NCERT Class 9 Maths Chapter 5 Hindi-medium PDF,
-  `data/demo/inputs/ncert-class9-maths-ch5-rekha-aur-kon-hindi-official.pdf`
-  (14 pages).
-- SHA-256:
-  `3f6d594f3a6f91d2fd202758eb60b53acb93d9b51f2d91cf496ce351e669160e`.
-- Ingest and preprocessing completed. Indic-OCR succeeded on the first five
-  pages (61 blocks) but repeatedly returned provider-side HTTP 502 on page 6:
-  *"the recognizer did not return a usable transcription for 1 of 10 blocks
-  (order 12: repetitive); the page was not transcribed"*.
-- The pipeline stopped before translation, narration, transcription and export.
-  **No second-source target-language output exists.** One controlled resume
-  reused the five cached pages and reproduced the same failure; no further
-  retry is recommended without provider guidance.
+- Completed: ingestion, OCR **20/20 pages (239 blocks)**, structure **224
+  blocks**, Tamil translation **224/224 blocks (0 failed)**, composition
+  (6 sections, provenance for recovered `p6-b11`), narration **10/10
+  sections**, transcription **146/146 chunks**, CER, audio assembly and
+  export. All ten stages are `done`.
+- **Macro CER 16.3023%, micro CER 15.2483%** (3 Excellent, 4 Needs Review,
+  3 Poor), normalization `nfc+ws-collapse-v1`, reference = exact Indic-Speak
+  input in `narrate/segments.json`.
+- Full lesson audio **4,287.744 s**, PCM16/24 kHz/mono, with a 10-section
+  sidecar timeline and assembly manifest.
+- The successful transcription run used `TRANSCRIBE_PACING_S=8` and
+  `BODHAN_MAX_RETRIES=3` and recorded **zero HTTP 429 responses**. An earlier
+  unbounded-burst attempt had been rate-limited; the permanent fix adds
+  bounded backoff for headerless 429s, honours `Retry-After`, keeps
+  auth/validation/budget failures terminal, and checkpoints each chunk.
+- Artifacts: `data/work/ncert-class9-science-ch2-cell-hindi/` and
+  `data/exports/ncert-class9-science-ch2-cell-hindi/`.
 
-This is **not** a successful second-source validation.
+A separate earlier candidate, NCERT Class 9 Maths Chapter 5 Hindi-medium PDF
+(14 pages, SHA-256 `3f6d594f…`), was blocked by a provider-side OCR 502 on
+page 6. It is historical evidence only and is not the selected second source.
 
 ## E. Known limitations
 
-- CER is inflated because the reference is the exact Indic-Speak input, which
-  retains LaTeX commands, `$` delimiters and digits that are not necessarily
-  spoken verbatim. It measures markup-to-speech divergence as well as STT
-  quality; no reference text was modified to improve the score.
-- Headerless STT 429 responses are terminal under the existing retry policy;
-  controlled, spaced resume runs were required. Stage-level pacing for such
-  rate limits is not implemented.
-- Some provider telemetry is unavailable: request IDs, OCR/translate/latency
-  details for some stages, usage for Indic-Speak/Indic-Transcribe, and any
-  monetary cost. `report.json` records these as null with explicit reasons.
-- The Chapter 5 OCR 502 remains unresolved.
-- No demo video has been recorded; `docs/VIDEO_SCRIPT.md` is a script only.
-- No pull request or submission email has been created.
+- CER is inflated by LaTeX, `$` delimiters and digits in the exact TTS input
+  that are not necessarily spoken verbatim; no reference was rewritten.
+- `report.json` records unavailable provider request IDs, some usage/latency
+  values and monetary cost as **null with explicit reasons**; null retry
+  fields mean "not persisted", not zero. STT cost is an **estimate**
+  (₹0.10 per audio minute), never provider-reported.
+- The 224 existing second-source translation checkpoints retain historical
+  zero `math_span_count`/`unit_span_count` values. Phase 6AJ fixes newly
+  generated checkpoints; historical artifacts were not backfilled.
+- `plan_sections` previously rejected overlapping lesson headings where one
+  heading is a prefix of a longer one. The permanent fix selects the longest
+  matching normalized heading and rejects only equal-length ties; existing
+  duplicate-heading validation is unchanged.
+- No demo video has been recorded; `VIDEO_SCRIPT.md` is a script only.
+- No remote, PR or submission email exists; fresh-clone verification of the
+  current uncommitted changes has not been performed.
 
 ## F. Verification evidence
 
-- Latest verified suite: **437 tests passed** in Phase 6N. No source or test
-  changes were made after that run.
-- Static checks were green: Ruff, Ruff format, Mypy and `uv lock --check --offline`.
-- Fresh-clone verification passed at HEAD `f7d1e80…` during Phase 6F-R
-  (`uv sync --frozen`, tests, static checks, CLI help, math-safe tests).
-  **The twelve uncommitted files (seven implementation/test changes and five
-  documentation/configuration updates) made after that verification still
-  require a new fresh-clone verification once they are committed.**
-- Protected Chapter 6 hashes (hi/ta/bn outputs, reports and full-lesson WAVs)
-  were rechecked after each later phase and remain unchanged.
+- Latest verified suite: **512 tests passed** (Phase 6AV full offline run;
+  earlier baseline **508 passed** before four assembler regression tests).
+- Ruff, Ruff format, Mypy (`src`) and `uv lock --check` all passed.
+- Both demonstrations were audited artifact-by-artifact: all stages `done`,
+  CER reports present, audio timelines continuous and hashes consistent.
+- Fresh-clone verification passed at earlier commits (`f7d1e80…`, `ec22973…`)
+  for the then-committed 12-file state. **The current uncommitted changes
+  have not yet been verified in a fresh clone after commit.**
+- Protected baselines and source PDFs remained unchanged after every later
+  phase.
+
+## G. Requirement-evidence matrix
+
+*No original assignment specification file exists locally; requirements below
+are reconstructed from README/docs/tests.*
+
+| Requirement | Evidence | Status | Missing work |
+|---|---|---|---|
+| CLI contract | pyproject, CLI source, prior `--help` checks | PASS | — |
+| Bodhan-only language providers | wiring.py + adapters | PASS | — |
+| LLM boundaries | English-only plan validation + tests | PASS | — |
+| OCR/translate/narrate/transcribe stages | 4 completed runs | PASS | — |
+| Retry/checkpoint/failure isolation | code + live resumes + tests | PASS | — |
+| Headerless 429 backoff + configurable pacing | `indic_transcribe.py`, `config.py`, `wiring.py`, tests, zero-429 live run | PASS | — |
+| CER / assembly / report | 4 complete sets | PASS | — |
+| Multilingual same-chapter evidence | hi/ta/bn Chapter 6 | PASS | — |
+| Second-source OCR + translation | 20/20 pages, 224/224 blocks | PASS | — |
+| Second-source compose/narrate/transcript/CER/audio/report | all stages done, CER 16.3023/15.2483 | PASS | — |
+| Assembler overlapping headings | longest-match fix + 4 regression tests | PASS | — |
+| Fresh-clone reproducibility | passed at earlier commits | PARTIAL | Re-verify after committing current changes |
+| Demo video | script only | FAIL | Record video |
+| PR / submission email | no remote | NOT VERIFIED | Configure remote, PR, email |
+
+## H. Remaining submission tasks
+
+1. Commit the current uncommitted implementation/test and documentation changes.
+2. Re-run the full offline suite and static checks at the new HEAD.
+3. Repeat fresh-clone verification at the new HEAD.
+4. Record the demo video from existing Chapter 6 and Chapter 2 artifacts.
+5. Configure a remote and prepare the PR and submission email when authorized.

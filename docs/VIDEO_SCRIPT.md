@@ -2,8 +2,9 @@
 
 This is a **script only**. No demo video file exists in the repository.
 Do not present this document as recorded footage. The narration below must only
-describe artifacts that actually exist; for the second-source Chapter 5 attempt,
-disclose the OCR failure explicitly.
+describe artifacts that actually exist. Both demonstrations are complete:
+Chapter 6 in hi/ta/bn and the second-source Science Chapter 2 in Tamil, with
+CER reports and assembled audio for every run.
 
 ## Sequence
 
@@ -58,19 +59,24 @@ Show `docs/ARCHITECTURE.md`. Close with the honest limitations:
 - Bodhan Indic-OCR, Indic-Translate, Indic-Speak and Indic-Transcribe are the
   only language providers; Gemini is limited to structure/quality/English plan.
 - CER is markup-sensitive; provider request IDs, usage and cost are partly
-  unavailable; headerless STT 429s required controlled resumes.
-- The second official source,
-  `data/demo/inputs/ncert-class9-maths-ch5-rekha-aur-kon-hindi-official.pdf`
-  (14 pages, Hindi medium), completed ingest and preprocessing and OCR on five
-  pages, then hit a provider-side HTTP 502 on page 6. There is no second-source
-  target-language output; no further retry is recommended without provider
-  guidance.
+  unavailable — STT cost is an estimate, not provider-reported.
+- Headerless STT 429s are now retried with bounded backoff; `TRANSCRIBE_PACING_S=8`
+  and `BODHAN_MAX_RETRIES=3` produced zero 429s in the successful paced run,
+  and every ≤30 s chunk is checkpointed for safe resume.
+- The selected second source,
+  `D:\phase6w-temp\ncert-class9-science-hi-ch2-ihsc102.pdf` (20 pages, Hindi
+  medium), completed all ten stages for Tamil: OCR 20/20 pages (239 blocks),
+  224/224 translations, 10 narration sections, 146/146 transcription chunks,
+  macro CER 16.3023% / micro CER 15.2483%, and 4,287.744 s of full audio. Show
+  `data/work/ncert-class9-science-ch2-cell-hindi/report.json` and
+  `data/exports/ncert-class9-science-ch2-cell-hindi/lesson.html`.
+  An earlier Chapter 5 candidate was blocked by an OCR 502 on page 6.
 - This video has not been recorded; the script is provided for a future recording.
 
 ## Recording checklist (all currently unchecked)
 
 - [ ] Record the video from the artifacts above.
-- [ ] Confirm all Chapter 6 stages are `done` before narrating "generated live".
+- [ ] Confirm all Chapter 6 and Chapter 2 stages are `done` before narrating "generated live".
 - [ ] Do not show `.env` contents or any credential on screen.
 - [ ] Keep total runtime ≤5:00.
-- [ ] State explicitly that Chapter 5 is blocked; do not imply success.
+- [ ] State explicitly that the video is not yet recorded and that cost is estimated.

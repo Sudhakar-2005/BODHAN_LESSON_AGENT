@@ -102,5 +102,6 @@ def build_providers(settings: Settings, *, target_language: str | None = None) -
             timeout_s=settings.bodhan_timeout_s,
             max_retries=settings.bodhan_max_retries,
             max_audio_seconds=settings.transcribe_max_audio_s,
+            pace_s=settings.transcribe_pacing_s,
         ),
     )

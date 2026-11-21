@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from bodhan.assembly import AudioAssemblyError, assemble_audio, require_ffmpeg
+from bodhan.assembly.audio import plan_sections
 
 MARKDOWN = "# Lesson Title\n## Section Alpha\n## Section Beta\n"
 
@@ -122,6 +123,64 @@ def test_no_embedded_chapters_are_claimed(tmp_path: Path) -> None:
     assert "sidecar only" in result.timeline["marker_source"]
     assert result.manifest["embedded_chapters"] is False
     assert "WAV" in result.manifest["embedded_chapters_reason"]
+
+
+# --- overlapping headings ---------------------------------------------------
+
+
+def test_short_heading_and_longer_heading_share_a_prefix() -> None:
+    markdown = "# Summary and Questions\n## Summary\n"
+    segments = [
+        {"segment_id": "seg-01", "text": "Summary and Questions. Body.", "audio_path": "a.wav"},
+        {"segment_id": "seg-02", "text": "Summary. Body.", "audio_path": "b.wav"},
+    ]
+
+    planned = plan_sections(segments, markdown)
+
+    assert [section["section_id"] for section in planned] == ["seg-01", "seg-02"]
+    assert [section["section_title"] for section in planned] == [
+        "Summary and Questions",
+        "Summary",
+    ]
+
+
+def test_longest_matching_heading_wins_regardless_of_segment_order() -> None:
+    markdown = "# Summary and Questions\n## Summary\n"
+    segments = [
+        {"segment_id": "seg-02", "text": "Summary. Body.", "audio_path": "b.wav"},
+        {"segment_id": "seg-01", "text": "Summary and Questions. Body.", "audio_path": "a.wav"},
+    ]
+
+    planned = plan_sections(segments, markdown)
+
+    assert [section["section_title"] for section in planned] == [
+        "Summary and Questions",
+        "Summary",
+    ]
+    assert planned[0]["section_id"] == "seg-01"
+
+
+def test_equal_length_ambiguous_matches_are_rejected() -> None:
+    # Two raw headings normalize to the same string, so both are equally long
+    # prefix matches: that is ambiguous and must never be guessed.
+    markdown = "# Section  One\n## Section One\n"
+    segments = [{"segment_id": "seg-01", "text": "Section One. Body.", "audio_path": "a.wav"}]
+
+    with pytest.raises(AudioAssemblyError, match="ambiguous longest matches"):
+        plan_sections(segments, markdown)
+
+
+def test_prefix_free_headings_keep_their_behavior() -> None:
+    markdown = "# Alpha\n## Beta\n"
+    segments = [
+        {"segment_id": "seg-02", "text": "Beta. Second.", "audio_path": "b.wav"},
+        {"segment_id": "seg-01", "text": "Alpha. First.", "audio_path": "a.wav"},
+    ]
+
+    planned = plan_sections(segments, markdown)
+
+    assert [section["section_title"] for section in planned] == ["Alpha", "Beta"]
+    assert [section["section_id"] for section in planned] == ["seg-01", "seg-02"]
 
 
 # --- explicit failure handling ---------------------------------------------

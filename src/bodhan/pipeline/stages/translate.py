@@ -120,14 +120,16 @@ async def _translate_text(ctx: StageContext, text: str, target: str) -> dict[str
         raise PipelineError("ambiguous mathematical boundaries (unbalanced delimiters)")
 
     math_spans = [segment.text for segment in segments if segment.kind == "math"]
+    unit_spans = [segment.text for segment in segments if segment.kind == "unit"]
     if not prose_to_translate(segments):
-        # Math-only (or whitespace-only) blocks never reach the provider.
+        # Protected-only (or whitespace-only) blocks never reach the provider.
         return {
             "text": text,
             "usage": {},
             "api_called": False,
             "math_only": preserve_math_only(text),
             "math_span_count": len(math_spans),
+            "unit_span_count": len(unit_spans),
         }
 
     translated_chunks: list[str] = []
@@ -151,6 +153,7 @@ async def _translate_text(ctx: StageContext, text: str, target: str) -> dict[str
         "api_called": True,
         "math_spans_verified": verified,
         "math_span_count": len(math_spans),
+        "unit_span_count": len(unit_spans),
     }
 
 
@@ -182,6 +185,8 @@ async def run(ctx: StageContext) -> dict[str, Any]:
     empty = 0
     reused = 0
     table_cells = 0
+    table_math_count = 0
+    table_unit_count = 0
 
     def add_usage(usage: dict[str, Any]) -> None:
         for key, value in usage.items():
@@ -236,6 +241,8 @@ async def run(ctx: StageContext) -> dict[str, Any]:
                                 else {"text": "", "usage": {}, "api_called": False}
                             )
                             add_usage(cell_result["usage"])
+                            table_math_count += int(cell_result.get("math_span_count", 0))
+                            table_unit_count += int(cell_result.get("unit_span_count", 0))
                             translated_cells[(cell.row, cell.column)] = cell_result["text"]
                             cell_status, error, translated = "ok", None, cell_result["text"]
                             table_cells += 1
@@ -280,6 +287,8 @@ async def run(ctx: StageContext) -> dict[str, Any]:
                             "translation": render_table_markdown(grid, translated_cells),
                             "usage": {},
                             "table": table_payload,
+                            "math_span_count": table_math_count,
+                            "unit_span_count": table_unit_count,
                         }
                 else:
                     text_result = await _translate_text(ctx, block.text, target)
@@ -288,6 +297,8 @@ async def run(ctx: StageContext) -> dict[str, Any]:
                         "status": "ok",
                         "translation": text_result["text"],
                         "usage": text_result["usage"],
+                        "math_span_count": text_result["math_span_count"],
+                        "unit_span_count": text_result["unit_span_count"],
                     }
         except Exception as exc:  # isolate the failure to this block/table
             message = f"{type(exc).__name__}: {exc}"
@@ -321,6 +332,7 @@ async def run(ctx: StageContext) -> dict[str, Any]:
             # New field; absent in legacy checkpoints, which stay reusable.
             "translation_strategy": "span-split-v1",
             "math_span_count": int(outcome.get("math_span_count", 0)),
+            "unit_span_count": int(outcome.get("unit_span_count", 0)),
         }
         if outcome.get("table"):
             checkpoint["table"] = outcome["table"]

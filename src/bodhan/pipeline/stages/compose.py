@@ -73,6 +73,18 @@ _SYSTEM = (
     "- No commentary, no placeholders, no markdown code fences."
 )
 
+_RECOVERY_SYSTEM = (
+    "You are completing a lesson plan that omitted some source blocks. Return "
+    'STRICT JSON only: {"sections":[{"heading_en":"...",'
+    '"block_ids":["..."]}]}\n'
+    "Rules:\n"
+    "- Use ONLY the supplied missing block ids, each exactly once.\n"
+    "- Write every heading in English only; never write Hindi, Tamil, Bengali "
+    "or any other Indian-language text.\n"
+    "- Never invent source ids, source text or facts; refer to blocks by id.\n"
+    "- No commentary, no placeholders, no markdown code fences."
+)
+
 #: Unicode ranges of the scripts used by Indian languages. Used to reject
 #: any Indian-language text the LLM might produce anyway. Covers the nine
 #: assignment-required scripts (Devanagari, Bengali, Gurmukhi, Gujarati,
@@ -267,6 +279,166 @@ def _validate_plan(raw: Any, known_ids: set[str]) -> _Plan:
     )
 
 
+def _placed_ids(raw: Any) -> list[str] | None:
+    """Return section block ids, or None when the plan is too malformed to recover."""
+    if not isinstance(raw, dict):
+        return None
+    sections = raw.get("sections")
+    if not isinstance(sections, list):
+        return None
+    placed: list[str] = []
+    for item in sections:
+        if not isinstance(item, dict):
+            return None
+        ids = item.get("block_ids")
+        if not isinstance(ids, list):
+            return None
+        placed.extend(str(block_id) for block_id in ids)
+    return placed
+
+
+def _missing_ids(raw: Any, known_ids: set[str]) -> list[str]:
+    """Find omitted ids; duplicates and unknown ids are left to strict validation."""
+    placed = _placed_ids(raw)
+    if placed is None:
+        return []
+    if len(set(placed)) != len(placed) or any(block_id not in known_ids for block_id in placed):
+        return []
+    return sorted(known_ids - set(placed))
+
+
+def _merge_recovery(
+    raw: dict[str, Any],
+    recovered: Any,
+    missing: list[str],
+    blocks: list[OCRBlock],
+) -> dict[str, Any]:
+    """Validate one recovery response and place its blocks by source reading order.
+
+    Recovery headings are validated but never replace an existing section
+    heading: recovered ids are inserted into the appropriate original section.
+    """
+    if not isinstance(recovered, dict):
+        raise PipelineError("compose recovery response must be a JSON object")
+    recovered_sections = recovered.get("sections")
+    if not isinstance(recovered_sections, list) or not recovered_sections:
+        raise PipelineError("compose recovery needs a non-empty 'sections' list")
+    missing_set = set(missing)
+    placed: list[str] = []
+    for index, item in enumerate(recovered_sections):
+        if not isinstance(item, dict):
+            raise PipelineError(f"compose recovery section {index} must be an object")
+        _english(item.get("heading_en"), f"recovery.sections[{index}].heading_en")
+        ids = item.get("block_ids")
+        if not isinstance(ids, list) or not ids:
+            raise PipelineError(f"compose recovery section {index} needs block_ids")
+        block_ids = [str(block_id) for block_id in ids]
+        for block_id in block_ids:
+            if block_id not in missing_set:
+                raise PipelineError(
+                    f"compose recovery section {index} referenced non-missing id {block_id!r}"
+                )
+        placed.extend(block_ids)
+    unresolved = sorted(missing_set - set(placed))
+    if unresolved:
+        raise PipelineError(f"compose recovery did not assign ids: {unresolved[:5]}")
+    if len(set(placed)) != len(placed):
+        raise PipelineError("compose recovery duplicated a missing block id")
+
+    positions = {block.block_id: (block.page_index, block.reading_order) for block in blocks}
+    expected = sorted(placed, key=lambda block_id: positions[block_id])
+    if placed != expected:
+        raise PipelineError("compose recovery violates source reading order")
+
+    merged = dict(raw)
+    sections: list[dict[str, Any]] = []
+    for section in raw["sections"]:
+        copied = dict(section)
+        copied["block_ids"] = list(section["block_ids"])
+        sections.append(copied)
+
+    for block_id in expected:
+        position = positions[block_id]
+        candidates: list[int] = []
+        for index, section in enumerate(sections):
+            section_positions = [positions[b] for b in section["block_ids"]]
+            if min(section_positions) <= position <= max(section_positions):
+                candidates.append(index)
+        if not candidates:
+            first = min(
+                range(len(sections)),
+                key=lambda i: min(positions[b] for b in sections[i]["block_ids"]),
+            )
+            last = max(
+                range(len(sections)),
+                key=lambda i: max(positions[b] for b in sections[i]["block_ids"]),
+            )
+            if position < min(positions[b] for b in sections[first]["block_ids"]):
+                candidates = [first]
+            elif position > max(positions[b] for b in sections[last]["block_ids"]):
+                candidates = [last]
+        if len(candidates) != 1:
+            raise PipelineError(
+                f"compose recovery placement for {block_id!r} is ambiguous at {position}; "
+                f"candidate sections: {candidates}; add an explicit section assignment"
+            )
+        section = sections[candidates[0]]
+        existing = section["block_ids"]
+        section_positions = [positions[b] for b in existing]
+        if section_positions != sorted(section_positions):
+            raise PipelineError(
+                f"compose recovery cannot place {block_id!r}: section blocks are not in source "
+                "reading order"
+            )
+        insert_at = len(existing)
+        for index, other in enumerate(existing):
+            if positions[other] > position:
+                insert_at = index
+                break
+        existing.insert(insert_at, block_id)
+    merged["sections"] = sections
+    return merged
+
+
+_RECOVERY_VERSION = "source-order-insert-v1"
+
+
+def _recovery_provenance(
+    original_ids: list[str], recovered_ids: list[str], requests: int
+) -> dict[str, Any]:
+    """Build backward-compatible recovery metadata for plan.json."""
+    return {
+        "used": bool(recovered_ids),
+        "version": _RECOVERY_VERSION,
+        "method": "source-order-insert-v1",
+        "requests": requests,
+        "original_block_ids": list(original_ids),
+        "recovered_block_ids": list(recovered_ids),
+    }
+
+
+def _validate_provenance(value: Any) -> None:
+    """Reject malformed recovery metadata before it is persisted."""
+    if not isinstance(value, dict):
+        raise PipelineError("compose recovery provenance must be an object")
+    required = {
+        "used": bool,
+        "version": str,
+        "method": str,
+        "requests": int,
+        "original_block_ids": list,
+        "recovered_block_ids": list,
+    }
+    for key, expected in required.items():
+        if key not in value or not isinstance(value[key], expected):
+            raise PipelineError(f"compose recovery provenance field {key!r} is invalid")
+    if value["requests"] < 0:
+        raise PipelineError("compose recovery provenance request count is invalid")
+    for key in ("original_block_ids", "recovered_block_ids"):
+        if not all(isinstance(item, str) for item in value[key]):
+            raise PipelineError(f"compose recovery provenance field {key!r} is invalid")
+
+
 def _load_blocks(ctx: StageContext) -> list[OCRBlock]:
     return [
         OCRBlock.model_validate(item)
@@ -401,13 +573,43 @@ async def run(ctx: StageContext) -> dict[str, Any]:
             "\nInclude EVERY entry of 'glossary_terms' in glossary_en "
             "(term_en/description_en in English)."
         )
+    known_ids = {block.block_id for block in blocks}
     raw = await complete_json(
         ctx.llm,
         system=_SYSTEM,
         user=user,
         stage=NAME.value,
     )
-    plan = _validate_plan(raw, {block.block_id for block in blocks})
+    original_ids = _placed_ids(raw) or []
+    missing = _missing_ids(raw, known_ids)
+    if missing:
+        # One bounded recovery request for only the omitted blocks; existing
+        # section assignments are never regenerated or reordered.
+        missing_set = set(missing)
+        recovery_payload = {
+            "chapter_title": ctx.chapter.title,
+            "missing_blocks": [
+                {
+                    "id": item["id"],
+                    "kind": item["kind"],
+                    "source_text": item["source_text"],
+                    "text": item["text"],
+                }
+                for item in content
+                if item["id"] in missing_set
+            ],
+        }
+        recovered = await complete_json(
+            ctx.llm,
+            system=_RECOVERY_SYSTEM,
+            user=f"Assign these missing blocks to lesson sections:\n{format_payload(recovery_payload)}",
+            stage=NAME.value,
+        )
+        raw = _merge_recovery(raw, recovered, missing, blocks)
+    provenance = _recovery_provenance(original_ids, missing, 1 if missing else 0)
+    _validate_provenance(provenance)
+    raw["recovery"] = provenance
+    plan = _validate_plan(raw, known_ids)
     # Audit trail: the exact (validated) English plan the LLM produced.
     save_json(ctx.store, NAME, "plan.json", raw)
 

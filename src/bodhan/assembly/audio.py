@@ -105,14 +105,23 @@ def plan_sections(segments: list[dict[str, Any]], markdown: str) -> list[dict[st
             raise AudioAssemblyError(f"narration segment {section_id} has no text")
         normalized_text = _normalize(text)
         matches = [
-            heading for heading in headings if normalized_text.startswith(_normalize(heading))
+            (heading, normalized_heading)
+            for heading in headings
+            if (normalized_heading := _normalize(heading))
+            and normalized_text.startswith(normalized_heading)
         ]
-        if len(matches) != 1:
+        if not matches:
+            raise AudioAssemblyError(f"cannot map section {section_id} to any lesson heading")
+        # A short heading may be the prefix of a longer one; the longest match
+        # carries the most evidence. Reject only genuine equal-length ties.
+        longest = max(len(normalized) for _, normalized in matches)
+        best = [heading for heading, normalized in matches if len(normalized) == longest]
+        if len(best) != 1:
             raise AudioAssemblyError(
                 f"cannot map section {section_id} to exactly one lesson heading "
-                f"(matches: {matches})"
+                f"(ambiguous longest matches: {best})"
             )
-        title = matches[0]
+        title = best[0]
         if title in used:
             raise AudioAssemblyError(f"two narration sections map to heading {title!r}")
         used.add(title)

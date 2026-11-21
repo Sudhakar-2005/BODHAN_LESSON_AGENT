@@ -14,6 +14,11 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Literal
 
+# Scientific unit symbols are prose-level notation, not standalone mathematics.
+# Matching them before the Greek-letter pattern keeps ``μm``/``µm`` intact
+# instead of fragmenting ``μ`` into a protected math span and ``m`` into prose.
+_SCIENTIFIC_UNIT_RE = re.compile("[μµ](?:m|g|s|l|mol|N|J|W|V|A|Ω)|\\b(?:mm|cm|km|nm|mg|kg)\\b")
+
 # Ordered longest-first: display math, inline math, LaTeX commands, script
 # tokens. Bare numbers and ordinary words are deliberately NOT protected.
 _PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -23,6 +28,7 @@ _PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\\\(.+?\\\)", re.DOTALL),
     re.compile(r"\\[A-Za-z]+\{[^}]*\}(?:\{[^}]*\})?"),
     re.compile(r"\b[A-Za-z0-9]+(?:_\{[^}]*\}|_[A-Za-z0-9]|\^\{[^}]*\}|\^[A-Za-z0-9])"),
+    _SCIENTIFIC_UNIT_RE,
     # Greek letters, math operators and relation symbols (Unicode, written as
     # escapes so the source ASCII stays unambiguous).
     re.compile(
@@ -48,9 +54,9 @@ _MARKER = re.compile(r"\ue000(\d+)\ue001")
 
 @dataclass(frozen=True)
 class TextSegment:
-    """One contiguous part of a mixed block: either math or prose."""
+    """One contiguous part: math, protected scientific unit, or prose."""
 
-    kind: Literal["math", "prose"]
+    kind: Literal["math", "unit", "prose"]
     text: str
 
 
@@ -78,6 +84,15 @@ def segment_mixed_text(text: str) -> tuple[list[TextSegment], bool]:
     for match in _MATH_SPAN_RE.finditer(text):
         start, end = match.span()
         span = match.group(0)
+        if _SCIENTIFIC_UNIT_RE.fullmatch(span):
+            # Keep the exact unit out of the provider payload and restore it
+            # deterministically, so a translation can never alter ``mm`` or
+            # ``μm``. Units are a separate protected category from math.
+            if start > cursor:
+                segments.append(TextSegment(kind="prose", text=text[cursor:start]))
+            segments.append(TextSegment(kind="unit", text=span))
+            cursor = end
+            continue
         prefix = _COMMAND_PREFIX.match(span)
         if (
             prefix is not None
@@ -127,7 +142,7 @@ def reassemble(segments: list[TextSegment], translated_prose: list[str]) -> str:
     output: list[str] = []
     index = 0
     for segment in segments:
-        if segment.kind == "math":
+        if segment.kind in {"math", "unit"}:
             output.append(segment.text)
         elif not segment.text.strip():
             output.append(segment.text)  # preserve exact whitespace
@@ -139,6 +154,31 @@ def reassemble(segments: list[TextSegment], translated_prose: list[str]) -> str:
     if index != len(translated_prose):
         raise ValueError("too many translated prose chunks for reassembly")
     return "".join(output)
+
+
+def _validate_scientific_units(segments: list[TextSegment], rebuilt: str) -> str | None:
+    """Verify protected units survived byte-for-byte, in order, with their count.
+
+    Units are a separate category from math, and their exact Unicode form is
+    preserved: ``μ`` (U+03BC) and ``µ`` (U+00B5) are never treated as equal.
+    """
+    expected = [segment.text for segment in segments if segment.kind == "unit"]
+    if not expected:
+        return None
+    rebuilt_segments, _ambiguous = segment_mixed_text(rebuilt)
+    found = [segment.text for segment in rebuilt_segments if segment.kind == "unit"]
+    expected_counts = Counter(expected)
+    found_counts = Counter(found)
+    for unit, count in expected_counts.items():
+        if found_counts.get(unit, 0) < count:
+            return f"scientific unit missing or altered after reconstruction: {unit!r}"
+    extra = found_counts - expected_counts
+    if extra:
+        unit = sorted(extra)[0]
+        return f"extra scientific unit introduced during reconstruction: {unit!r}"
+    if found != expected:
+        return "scientific units reordered after reconstruction"
+    return None
 
 
 def validate_math_spans(segments: list[TextSegment], rebuilt: str) -> tuple[str | None, int]:
@@ -172,6 +212,9 @@ def validate_math_spans(segments: list[TextSegment], rebuilt: str) -> tuple[str 
         return f"extra math span introduced during reconstruction: {span[:80]!r}", verified
     if found != expected:
         return "math spans reordered after reconstruction", len(expected)
+    unit_error = _validate_scientific_units(segments, rebuilt)
+    if unit_error is not None:
+        return unit_error, len(expected)
     return None, len(expected)
 
 
@@ -180,7 +223,7 @@ def preserve_math_only(text: str) -> bool:
     segments, ambiguous = segment_mixed_text(text)
     if ambiguous or not text.strip():
         return False
-    return all(segment.kind == "math" or not segment.text.strip() for segment in segments)
+    return all(segment.kind in {"math", "unit"} or not segment.text.strip() for segment in segments)
 
 
 def _marker(index: int) -> str:

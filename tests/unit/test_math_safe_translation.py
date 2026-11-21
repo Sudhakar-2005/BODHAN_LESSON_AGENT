@@ -570,3 +570,155 @@ def test_corrupted_math_near_text_command_still_fails() -> None:
 
     assert error is not None
     assert "missing or altered" in error or "extra math span" in error
+
+
+def _identity_rebuild(segments: list[TextSegment]) -> str:
+    """Reassemble with unchanged prose so only span handling is under test."""
+    return reassemble(segments, [s.text for s in segments if s.kind == "prose" and s.text.strip()])
+
+
+def _prose_index(segments: list[TextSegment], value: str) -> int:
+    prose = [s.text for s in segments if s.kind == "prose"]
+    return prose.index(value)
+
+
+def test_greek_mu_alone_remains_a_math_span() -> None:
+    segments, _ = segment_mixed_text("मान μ लिया")
+    assert any(s.kind == "math" and s.text == "μ" for s in segments)
+    assert validate_math_spans(segments, _identity_rebuild(segments))[0] is None
+
+    chunks = [s.text for s in segments if s.kind == "prose"]
+    chunks[_prose_index(segments, "मान ")] = "मान μ "
+    duplicated = reassemble(segments, chunks)
+    error, _count = validate_math_spans(segments, duplicated)
+    assert error is not None
+    assert "extra math span" in error
+
+
+def test_micro_sign_alone_is_prose() -> None:
+    segments, _ = segment_mixed_text("चिह्न µ है")
+    assert all(s.kind == "prose" for s in segments)
+    assert validate_math_spans(segments, _identity_rebuild(segments))[0] is None
+
+
+@pytest.mark.parametrize("unit", ["μm", "µm", "mm", "cm", "km", "nm", "mg", "kg"])
+def test_scientific_units_are_protected_and_never_sent_to_provider(unit: str) -> None:
+    segments, _ = segment_mixed_text(f"मान {unit} है")
+    assert any(s.kind == "unit" and s.text == unit for s in segments)
+    provider_chunks = prose_to_translate(segments)
+    assert all(unit not in chunk for chunk in provider_chunks)
+    rebuilt = _identity_rebuild(segments)
+    assert rebuilt.count(unit) == 1
+    assert validate_math_spans(segments, rebuilt)[0] is None
+
+
+def test_numeric_expression_with_units_is_preserved() -> None:
+    segments, _ = segment_mixed_text("1 mm = 1000 μm")
+    provider_chunks = prose_to_translate(segments)
+    assert all("mm" not in c and "μm" not in c for c in provider_chunks)
+    rebuilt = _identity_rebuild(segments)
+    assert "mm" in rebuilt and "μm" in rebuilt
+    assert validate_math_spans(segments, rebuilt)[0] is None
+
+
+def test_units_adjacent_to_punctuation_and_parentheses() -> None:
+    segments, _ = segment_mixed_text("मान (μm), (mm) और [nm] देखें")
+    rebuilt = _identity_rebuild(segments)
+    assert rebuilt.count("μm") == 1 and rebuilt.count("mm") == 1 and rebuilt.count("nm") == 1
+    assert validate_math_spans(segments, rebuilt)[0] is None
+
+
+def test_repeated_scientific_units_are_counted() -> None:
+    segments, _ = segment_mixed_text("μm और μm")
+    rebuilt = _identity_rebuild(segments)
+    assert rebuilt.count("μm") == 2
+    assert validate_math_spans(segments, rebuilt)[0] is None
+    assert (
+        "extra scientific unit"
+        in validate_math_spans(segments, rebuilt.replace("μm", "μm μm μm"))[0]
+    )
+
+
+def test_mixed_prose_units_and_latex_are_preserved() -> None:
+    text = "\\textbf{Solution :} $x = y$ और mm, μm µm"
+    segments, _ = segment_mixed_text(text)
+    rebuilt = _identity_rebuild(segments)
+    assert "$x = y$" in rebuilt and "\\textbf{" in rebuilt
+    assert rebuilt.count("mm") == 1
+    assert rebuilt.count("μm") == 1 and rebuilt.count("µm") == 1
+    assert validate_math_spans(segments, rebuilt)[0] is None
+
+
+def test_mixed_prose_and_scientific_notation_p2_b6() -> None:
+    """Exact Phase 6Y source: units are restored even if provider drops them."""
+    text = "इकाई रूपांतरण—\n1 मिलीमीटर (mm) = 1000 माइक्रोमीटर (μm)"
+    segments, _ = segment_mixed_text(text)
+    provider_chunks = prose_to_translate(segments)
+    assert all("mm" not in c and "μm" not in c for c in provider_chunks)
+    rebuilt = reassemble(segments, [" Tamil ", " Tamil ", " Tamil "])
+    assert rebuilt.count("mm") == 1 and rebuilt.count("μm") == 1
+    assert validate_math_spans(segments, rebuilt)[0] is None
+
+
+def test_missing_duplicated_modified_and_reordered_units_fail() -> None:
+    segments, _ = segment_mixed_text("μm और mm")
+    rebuilt = _identity_rebuild(segments)
+
+    assert "scientific unit missing" in validate_math_spans(segments, rebuilt.replace("μm", ""))[0]
+    assert (
+        "extra scientific unit" in validate_math_spans(segments, rebuilt.replace("mm", "mm mm"))[0]
+    )
+    # Exact Unicode is preserved: micro sign is not a substitute for Greek mu.
+    assert (
+        "scientific unit missing" in validate_math_spans(segments, rebuilt.replace("μm", "µm"))[0]
+    )
+    reordered_segments = [
+        TextSegment(kind="unit", text="μm"),
+        TextSegment(kind="prose", text=" and "),
+        TextSegment(kind="unit", text="mm"),
+    ]
+    assert "reordered" in validate_math_spans(reordered_segments, "mm and μm")[0]
+
+
+def test_math_expression_with_greek_symbols_still_validated() -> None:
+    text = "मान $\\alpha + \\beta = \\mu$ है"
+    segments, _ = segment_mixed_text(text)
+    assert validate_math_spans(segments, _identity_rebuild(segments))[0] is None
+
+    rebuilt = _identity_rebuild(segments).replace("\\mu", "\\nu")
+    error, _count = validate_math_spans(segments, rebuilt)
+    assert error is not None
+    assert "missing or altered" in error
+
+
+def test_missing_and_extra_math_spans_still_fail_with_units() -> None:
+    segments, _ = segment_mixed_text("मान $x$ और µm है")
+    rebuilt = _identity_rebuild(segments)
+
+    error, _count = validate_math_spans(segments, rebuilt.replace("$x$", ""))
+    assert error is not None and "missing or altered" in error
+    error, _count = validate_math_spans(segments, rebuilt + " $x$")
+    assert error is not None and "extra math span" in error
+
+
+def test_repeated_math_spans_still_accepted_with_units() -> None:
+    segments, _ = segment_mixed_text("$l$ and $m$; are $l$ and $m$ in mm?")
+    rebuilt = _identity_rebuild(segments)
+    assert rebuilt.count("$l$") == 2 and rebuilt.count("$m$") == 2
+    assert validate_math_spans(segments, rebuilt)[0] is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["\\textbf", "\\textit", "\\text", "\\mathrm", "\\mathbf", "\\emph", "\\mbox"],
+)
+def test_text_commands_still_validated_with_scientific_units(command: str) -> None:
+    text = f"{command}{{Solution :}} 1 µm = 1000 mm"
+    segments, _ = segment_mixed_text(text)
+    provider_chunks = prose_to_translate(segments)
+    assert all("µm" not in c and "mm" not in c for c in provider_chunks)
+    rebuilt = _identity_rebuild(segments)
+    assert "µm" in rebuilt and "mm" in rebuilt
+    error, count = validate_math_spans(segments, rebuilt)
+    assert error is None
+    assert count >= 2  # command delimiter pairs

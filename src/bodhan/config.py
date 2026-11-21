@@ -117,6 +117,10 @@ class Settings(BaseSettings):
     # Documented request ceiling: 30 s of audio; longer narration segments
     # are split client-side (WAV) and the piece texts joined verbatim.
     transcribe_max_audio_s: float = Field(default=30.0, gt=0, le=30.0)
+    # Delay before each Indic-Transcribe request (seconds; 0 disables).
+    # Requests are sequential; pacing spreads them out so a burst cannot
+    # exhaust the provider's RPM window. The window itself is never hardcoded.
+    transcribe_pacing_s: float = Field(default=0.0, ge=0.0)
 
     # --- CER evaluation (Phase 2B) -----------------------------------------
     # Configurable quality bands, expressed as CER percentages. These are
